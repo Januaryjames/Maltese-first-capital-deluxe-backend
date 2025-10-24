@@ -1,8 +1,7 @@
 {
-  "name": "maltese-first-capital-backend",
-  "version": "2.0.0",
-  "description": "Backend server for Maltese First Capital Banking Platform",
-  "type": "module",
+  "name": "maltese-first-backend",
+  "version": "1.0.0",
+  "type": "commonjs",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -15,11 +14,7 @@
     "express-rate-limit": "^7.1.5",
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
-    "mongoose": "^8.4.3",
+    "mongoose": "^8.5.1",
     "nodemailer": "^6.9.13"
-  },
-  "engines": {
-    "node": ">=20.x"
-  },
-  "license": "UNLICENSED"
+  }
 }
