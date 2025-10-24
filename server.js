@@ -36,9 +36,9 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true, service: 'mfc-backend', timestamp: new Date().toISOString() });
 });
 
-// Example placeholder routes (expand later)
+// Test route
 app.get('/api/test', (req, res) => {
-  res.json({ message: 'Test route working fine.' });
+  res.json({ message: 'API is working perfectly.' });
 });
 
 // ---------- Optional Static Frontend Serve ----------
@@ -47,10 +47,10 @@ const publicDir = path.join(__dirname, 'public');
 if (fs.existsSync(publicDir)) {
   app.use(express.static(publicDir));
   app.get('*', (req, res) => res.sendFile(path.join(publicDir, 'index.html')));
-  console.log('Serving static /public assets.');
+  console.log('📁 Serving static /public assets.');
 } else {
   app.get('/', (req, res) => res.json({ ok: true, service: 'mfc-backend', public: false }));
-  console.log('No /public folder detected; skipping static serve.');
+  console.log('ℹ️ No /public folder detected; skipping static serve.');
 }
 
 // ---------- Start Server ----------
