@@ -1,45 +1,75 @@
-const nodemailer = require('nodemailer');
+// routes/client.js
+const express = require("express");
+const router = express.Router();
+const multer = require("multer");
+const path = require("path");
+const fs = require("fs");
 
-const EMAIL_USER = process.env.EMAIL_USER; // hello@maltesefirst.com
-const EMAIL_PASS = process.env.EMAIL_PASS; // app password
+// Multer storage config
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const dir = path.join(__dirname, "../uploads");
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    cb(null, dir);
+  },
+  filename: (req, file, cb) => {
+    const unique = Date.now() + "-" + Math.round(Math.random() * 1e6);
+    cb(null, unique + "-" + file.originalname);
+  },
+});
+const upload = multer({ storage });
 
-let transporter = null;
+// Mock user data
+let documents = [];
 
-function getTransporter() {
-  if (transporter) return transporter;
-  transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: { user: EMAIL_USER, pass: EMAIL_PASS }
+// Profile endpoint
+router.get("/me", (req, res) => {
+  res.json({
+    name: "John Doe",
+    email: "john@doe.com",
+    phone: "+356 9999 0000",
+    address1: "St. Anne Street",
+    city: "Floriana",
+    zip: "FRN 9010",
+    country: "Malta",
+    currency: "EUR",
   });
-  return transporter;
-}
+});
 
-async function sendOtp(email, code) {
-  const t = getTransporter();
-  const html = `
-    <div style="font-family:system-ui,Segoe UI,Arial">
-      <h2>Maltese First Capital — Your OTP</h2>
-      <p>Your one-time code is:</p>
-      <p style="font-size:24px;font-weight:700;letter-spacing:3px">${code}</p>
-      <p>This code expires in 10 minutes.</p>
-    </div>`;
-  await t.sendMail({
-    from: `"Maltese First Capital" <${EMAIL_USER}>`,
-    to: email,
-    subject: 'Your One-Time Passcode',
-    html
-  });
-}
+// List documents
+router.get("/documents", (req, res) => {
+  res.json(documents);
+});
 
-async function notifyDocStatus(email, status, filename) {
-  const t = getTransporter();
-  await t.sendMail({
-    from: `"Maltese First Capital" <${EMAIL_USER}>`,
-    to: email,
-    subject: `Document ${status}: ${filename}`,
-    text: `Your document "${filename}" was ${status}.`,
-    html: `<p>Your document "<b>${filename}</b>" was <b>${status}</b>.</p>`
-  });
-}
+// Upload new document
+router.post("/document", upload.single("file"), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+  const doc = {
+    id: documents.length + 1,
+    category: req.body.category || "OTHER",
+    filename: req.file.filename,
+    path: `/uploads/${req.file.filename}`,
+    url: `/uploads/${req.file.filename}`,
+    createdAt: new Date(),
+    status: "pending",
+  };
+  documents.push(doc);
+  res.json(doc);
+});
 
-module.exports = { sendOtp, notifyDocStatus };
+// Delete document
+router.delete("/document/:id", (req, res) => {
+  const id = parseInt(req.params.id);
+  documents = documents.filter((d) => d.id !== id);
+  res.json({ success: true });
+});
+
+// Change password (mock)
+router.post("/password", (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  if (!currentPassword || !newPassword)
+    return res.status(400).json({ error: "Missing fields" });
+  res.json({ message: "Password updated" });
+});
+
+module.exports = router;
