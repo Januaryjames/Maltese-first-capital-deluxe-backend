@@ -1,30 +1,59 @@
+// -----------------------------
+// Maltese First Capital Backend
+// -----------------------------
 const express = require('express');
 const mongoose = require('mongoose');
+const cors = require('cors');
 const path = require('path');
-require('dotenv').config();
+const fs = require('fs');
 
 const app = express();
+const PORT = process.env.PORT || 10000;
+
+// ---------- Middleware ----------
 app.use(express.json());
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use(express.urlencoded({ extended: true }));
 
-// MongoDB connection
-mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
-  .then(() => console.log('✅ MongoDB connected'))
-  .catch(err => console.error('MongoDB connection error:', err));
+// ---------- CORS (restrict to your domains) ----------
+app.use(cors({
+  origin: ['https://maltesefirst.com', 'https://www.maltesefirst.com'],
+  credentials: true,
+}));
 
-// Routes
-app.use('/api/client', require('./routes/client'));
-app.use('/api/admin', require('./routes/admin'));
+// ---------- MongoDB Connection ----------
+const uri = process.env.MONGO_URI || process.env.MONGODB_URI;
 
-// Health check
-app.get('/api/health', (req, res) => res.json({ ok: true }));
+if (!uri) {
+  console.error('❌ No Mongo URI found. Please set MONGO_URI in Render > Environment.');
+} else {
+  mongoose.connect(uri, { useNewUrlParser: true, useUnifiedTopology: true })
+    .then(() => console.log('✅ MongoDB connected'))
+    .catch(err => console.error('❌ MongoDB connection error:', err.message));
+}
 
-// Serve frontend (optional)
-app.use(express.static(path.join(__dirname, 'public')));
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public/index.html'));
+// ---------- API Routes ----------
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true, service: 'mfc-backend', timestamp: new Date().toISOString() });
 });
 
-// Start
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+// Example placeholder routes (expand later)
+app.get('/api/test', (req, res) => {
+  res.json({ message: 'Test route working fine.' });
+});
+
+// ---------- Optional Static Frontend Serve ----------
+const publicDir = path.join(__dirname, 'public');
+
+if (fs.existsSync(publicDir)) {
+  app.use(express.static(publicDir));
+  app.get('*', (req, res) => res.sendFile(path.join(publicDir, 'index.html')));
+  console.log('Serving static /public assets.');
+} else {
+  app.get('/', (req, res) => res.json({ ok: true, service: 'mfc-backend', public: false }));
+  console.log('No /public folder detected; skipping static serve.');
+}
+
+// ---------- Start Server ----------
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
