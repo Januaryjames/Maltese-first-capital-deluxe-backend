@@ -1,23 +1,42 @@
-const express = require('express');
-const fs = require('fs');
-const path = require('path');
+// routes/admin.js
+const express = require("express");
 const router = express.Router();
 
-// ---------- Approve Uploaded Docs ----------
-router.get('/documents', (req, res) => {
-  const dir = path.join(__dirname, '../uploads');
-  if (!fs.existsSync(dir)) return res.json({ documents: [] });
+// Mock document DB
+let documents = [
+  { id: 1, clientName: "John Doe", clientEmail: "john@doe.com", category: "ID", status: "pending", createdAt: new Date() },
+  { id: 2, clientName: "Sarah Borg", clientEmail: "sarah@borg.com", category: "POA", status: "review", createdAt: new Date() },
+];
 
-  const files = fs.readdirSync(dir);
-  res.json({ documents: files });
+// List all docs
+router.get("/documents", (req, res) => {
+  res.json(documents);
 });
 
-router.post('/approve', (req, res) => {
-  const { filename } = req.body;
-  if (!filename) return res.status(400).json({ error: 'Filename missing' });
+// Approve
+router.post("/document/:id/approve", (req, res) => {
+  const id = parseInt(req.params.id);
+  documents = documents.map((d) =>
+    d.id === id ? { ...d, status: "approved" } : d
+  );
+  res.json({ message: "Document approved" });
+});
 
-  // This is where you’d flag approval status in MongoDB later
-  res.json({ message: `Document "${filename}" approved.` });
+// Reject
+router.post("/document/:id/reject", (req, res) => {
+  const id = parseInt(req.params.id);
+  documents = documents.map((d) =>
+    d.id === id ? { ...d, status: "rejected" } : d
+  );
+  res.json({ message: "Document rejected" });
+});
+
+// Request more docs
+router.post("/document/request-docs", (req, res) => {
+  const { userId, note } = req.body;
+  if (!userId || !note)
+    return res.status(400).json({ error: "Missing userId or note" });
+  res.json({ message: `Request sent to user ${userId}` });
 });
 
 module.exports = router;
