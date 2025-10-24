@@ -1,29 +1,23 @@
 const express = require('express');
-const ClientDoc = require('../models/ClientDoc');
-const r = express.Router();
+const fs = require('fs');
+const path = require('path');
+const router = express.Router();
 
-// Fake admin auth for now (replace later)
-function authAdmin(req,res,next){ next(); }
+// ---------- Approve Uploaded Docs ----------
+router.get('/documents', (req, res) => {
+  const dir = path.join(__dirname, '../uploads');
+  if (!fs.existsSync(dir)) return res.json({ documents: [] });
 
-r.get('/documents', authAdmin, async (req, res) => {
-  const docs = await ClientDoc.find().sort({ createdAt: -1 }).limit(200).lean();
-  res.json(docs);
+  const files = fs.readdirSync(dir);
+  res.json({ documents: files });
 });
 
-r.post('/document/:id/approve', authAdmin, async (req, res) => {
-  await ClientDoc.findByIdAndUpdate(req.params.id, { status: 'approved' });
-  res.json({ ok: true });
+router.post('/approve', (req, res) => {
+  const { filename } = req.body;
+  if (!filename) return res.status(400).json({ error: 'Filename missing' });
+
+  // This is where you’d flag approval status in MongoDB later
+  res.json({ message: `Document "${filename}" approved.` });
 });
 
-r.post('/document/:id/reject', authAdmin, async (req, res) => {
-  await ClientDoc.findByIdAndUpdate(req.params.id, { status: 'rejected' });
-  res.json({ ok: true });
-});
-
-r.post('/document/request-docs', authAdmin, async (req, res) => {
-  const { userId, note } = req.body;
-  console.log(`Requesting more docs from ${userId}: ${note}`);
-  res.json({ ok: true });
-});
-
-module.exports = r;
+module.exports = router;
