@@ -1,11 +1,12 @@
 services:
   - type: web
-    name: maltese-first-capital-backend
+    name: maltese-first-capital-deluxe-backend
     env: node
     plan: free
-    region: frankfurt
-    buildCommand: npm install
-    startCommand: npm start
+    buildCommand: "npm install"
+    startCommand: "npm start"
+    autoDeploy: true
+    healthCheckPath: "/api/health"
     envVars:
       - key: MONGODB_URI
         sync: false
@@ -15,10 +16,5 @@ services:
         sync: false
       - key: EMAIL_PASS
         sync: false
-      - key: ADMIN_USER
+      - key: ALLOWED_ORIGIN
         sync: false
-      - key: ADMIN_PASS
-        sync: false
-      - key: FRONTEND_ORIGINS
-        sync: false
-
