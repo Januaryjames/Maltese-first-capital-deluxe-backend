@@ -1,330 +1,488 @@
-// server.js  — Maltese First Capital (Node 20+, ESM)
-// Ensure your package.json has:  "type": "module",  "start": "node server.js"
+/**
+ * Maltese First Capital — Backend API
+ * Features:
+ * - Health check for Render
+ * - CORS locked to maltesefirst.com
+ * - MongoDB models (User, Transaction, KycSubmission, Admin)
+ * - Client registration (OTP email), OTP verify, client login (JWT)
+ * - 8-digit unique account number generator
+ * - Admin login (JWT), add/edit/delete transactions, edit statements
+ * - KYC submit / admin request-more / approve
+ * - Secure headers, rate limit, JSON size limits
+ *
+ * Env Vars (Render → Environment):
+ *  MONGODB_URI=...
+ *  JWT_SECRET=longrandomstring
+ *  EMAIL_USER=hello@maltesefirst.com
+ *  EMAIL_PASS=<gmail_app_password>
+ *  ALLOWED_ORIGIN=https://maltesefirst.com
+ *  UPLOADTHING_TOKEN=<optional, if using UploadThing in the frontend>
+ */
 
-import express from 'express';
-import mongoose from 'mongoose';
-import cors from 'cors';
-import helmet from 'helmet';
-import rateLimit from 'express-rate-limit';
-import jwt from 'jsonwebtoken';
-import bcrypt from 'bcryptjs';
-import nodemailer from 'nodemailer';
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const nodemailer = require('nodemailer');
 
-// ----------- ENV -----------
 const {
-  PORT = 10000,
   MONGODB_URI,
-  JWT_SECRET = 'change_me',
+  JWT_SECRET,
   EMAIL_USER,
   EMAIL_PASS,
-  ADMIN_USER = 'mfcliveadmin',
-  ADMIN_PASS = 'MFC!7hP9r2qZsX8d',
-  FRONTEND_ORIGINS // optional: comma-separated allowlist
+  ALLOWED_ORIGIN
 } = process.env;
 
-if (!MONGODB_URI) {
-  console.error('❌ MONGODB_URI missing'); process.exit(1);
+if (!MONGODB_URI || !JWT_SECRET || !EMAIL_USER || !EMAIL_PASS) {
+  console.log('[WARN] Missing required env vars. Check MONGODB_URI, JWT_SECRET, EMAIL_USER, EMAIL_PASS.');
 }
 
-// ----------- APP -----------
 const app = express();
-app.use(express.json({ limit: '2mb' }));
-app.use(helmet());
 
-// CORS allowlist (your two Render static sites by default)
-const defaultOrigins = [
-  'https://maltese-first-capital-deluxe-frontend.onrender.com',
-  'https://maltese-first-capital-deluxe-frontend-full.onrender.com'
-];
-const allowList = (FRONTEND_ORIGINS ? FRONTEND_ORIGINS.split(',') : defaultOrigins)
-  .map(s => s.trim()).filter(Boolean);
-
-app.use(cors({
-  origin: (origin, cb) => cb(null, !origin || allowList.includes(origin)),
-  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization']
+/* ---------- Security / Infra ---------- */
+app.set('trust proxy', 1); // needed behind Render proxy
+app.use(helmet({
+  crossOriginEmbedderPolicy: false, // allow images/fonts
+  contentSecurityPolicy: false      // CSP handled at static site; API returns JSON
 }));
-app.options('*', cors());
 
-// Basic rate limits
-const authLimiter = rateLimit({ windowMs: 60_000, max: 60 });
-app.use('/api/', authLimiter);
+// CORS only for your domain(s)
+const allowedOrigins = [
+  'https://maltesefirst.com',
+  'https://www.maltesefirst.com',
+];
+if (ALLOWED_ORIGIN && !allowedOrigins.includes(ALLOWED_ORIGIN)) {
+  allowedOrigins.push(ALLOWED_ORIGIN);
+}
+app.use(cors({
+  origin: (origin, cb) => {
+    // allow curl/Postman with no origin
+    if (!origin) return cb(null, true);
+    cb(null, allowedOrigins.includes(origin));
+  },
+  credentials: true
+}));
 
-// ----------- DB -----------
-await mongoose.connect(MONGODB_URI, { dbName: 'mfc_internal' });
-mongoose.connection.on('connected', () => console.log('✅ Mongo connected'));
+// rate limit to keep bots in check
+app.use('/api/', rateLimit({
+  windowMs: 60 * 1000,
+  max: 120
+}));
 
-// ----------- MODELS -----------
-const UserSchema = new mongoose.Schema({
-  fullName: String,
-  email: { type: String, unique: true },
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true, limit: '2mb' }));
+
+/* ---------- Database ---------- */
+mongoose.set('strictQuery', true);
+mongoose.connect(MONGODB_URI, { dbName: 'mfc' })
+  .then(() => console.log('[DB] connected'))
+  .catch(err => console.error('[DB] error', err));
+
+/* ---------- Schemas ---------- */
+const userSchema = new mongoose.Schema({
+  email: { type: String, unique: true, sparse: true, index: true },
   passwordHash: String,
-  phone: String,
-  address: String,
-  govId: String
-}, { timestamps: true });
-const User = mongoose.model('User', UserSchema);
-
-const AccountSchema = new mongoose.Schema({
-  userId: mongoose.ObjectId,
-  currency: { type: String, enum: ['USD','EUR'] },
-  accountNumber: { type: String, index: true }, // 8-digit string
-  balance: { type: Number, default: 0 }
-}, { timestamps: true });
-const Account = mongoose.model('Account', AccountSchema);
-
-const TxSchema = new mongoose.Schema({
-  userId: mongoose.ObjectId,
-  currency: { type: String, enum: ['USD','EUR'] },
-  type: { type: String, enum: ['credit','debit'] },
-  amount: Number,
-  desc: String
-}, { timestamps: true });
-const Tx = mongoose.model('Tx', TxSchema);
-
-// Temporary registration (email OTP before creating user)
-const TempRegSchema = new mongoose.Schema({
-  fullName: String, email: String, passwordHash: String,
-  phone: String, address: String, govId: String,
-  otp: String, otpExpires: Date
-}, { timestamps: true });
-const TempReg = mongoose.model('TempReg', TempRegSchema);
-
-// Login 2FA (email OTP)
-const Login2FASchema = new mongoose.Schema({
-  userId: mongoose.ObjectId,
-  otp: String, otpExpires: Date
-}, { timestamps: true });
-const Login2FA = mongoose.model('Login2FA', Login2FASchema);
-
-// KYC records (UploadThing URLs saved here)
-const KYCSchema = new mongoose.Schema({
-  regId: String,
-  userId: mongoose.ObjectId,
   fullName: String,
-  email: String,
-  docType: String,
-  docFrontUrl: String,
-  docBackUrl: String,
-  selfieUrl: String,
-  status: { type: String, enum: ['pending','approved','rejected'], default: 'pending' },
+  accountNumber: { type: String, unique: true, sparse: true, index: true }, // 8 digits
+  baseCurrency: { type: String, default: 'USD' },
+  balance: { type: Number, default: 0 },
+  statementNotes: { type: String, default: '' }, // admin-editable statement blurb
+  createdAt: { type: Date, default: Date.now },
+
+  // OTP for registration / login verification
+  otp: {
+    code: String,
+    expiresAt: Date,
+    purpose: String // 'register' | 'login'
+  },
+
+  // Simple KYC status
+  kyc: {
+    status: { type: String, enum: ['none', 'submitted', 'needs-more', 'approved'], default: 'none' },
+    documents: [{
+      kind: String,           // 'id', 'poa', 'selfie'
+      url: String,
+      uploadedAt: Date
+    }],
+    adminNotes: String
+  }
+});
+
+const transactionSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
+  type: { type: String, enum: ['credit', 'debit'], required: true },
+  currency: { type: String, default: 'USD' },
+  amount: { type: Number, required: true },
+  description: { type: String, default: '' },
+  createdAt: { type: Date, default: Date.now },
+  editedAt: Date
+});
+
+const kycSubmissionSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
+  items: [{
+    kind: String, // 'id', 'poa', 'selfie'
+    url: String
+  }],
+  status: { type: String, enum: ['submitted', 'needs-more', 'approved'], default: 'submitted' },
   notes: String,
   createdAt: { type: Date, default: Date.now },
-  decidedAt: Date
+  updatedAt: Date
 });
-const KYC = mongoose.model('KYC', KYCSchema);
 
-// ----------- HELPERS -----------
-const tokenFor = (sub, role) => jwt.sign({ sub, role }, JWT_SECRET, { expiresIn: '2d' });
+const adminSchema = new mongoose.Schema({
+  username: { type: String, unique: true, index: true },
+  passwordHash: String,
+  createdAt: { type: Date, default: Date.now }
+});
 
-async function sendMail(to, subject, text) {
-  if (!EMAIL_USER || !EMAIL_PASS) {
-    console.log('✉️ (dev) email to:', to, subject, text);
-    return;
-  }
-  const transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: { user: EMAIL_USER, pass: EMAIL_PASS }
+const User = mongoose.model('User', userSchema);
+const Transaction = mongoose.model('Transaction', transactionSchema);
+const KycSubmission = mongoose.model('KycSubmission', kycSubmissionSchema);
+const Admin = mongoose.model('Admin', adminSchema);
+
+/* ---------- Mail (OTP) ---------- */
+const transporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: { user: EMAIL_USER, pass: EMAIL_PASS }
+});
+
+async function sendOtpEmail(to, code) {
+  const html = `
+    <div style="font-family:system-ui,Segoe UI,Roboto,Arial;padding:16px">
+      <h2 style="margin:0 0 8px;color:#0b2a3d">Your Maltese First Capital code</h2>
+      <p>Use the one-time code below to continue:</p>
+      <div style="font-size:26px;font-weight:800;letter-spacing:3px;color:#0b2a3d">${code}</div>
+      <p style="color:#666">This code expires in 10 minutes.</p>
+    </div>`;
+  await transporter.sendMail({
+    from: `Maltese First Capital <${EMAIL_USER}>`,
+    to,
+    subject: 'Your verification code',
+    html
   });
-  await transporter.sendMail({ from: EMAIL_USER, to, subject, text });
 }
 
-function genOTP(n = 6) {
-  return Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join('');
+/* ---------- Helpers ---------- */
+function signToken(payload, expires = '7d') {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: expires });
 }
 
-async function genUnique8() {
-  while (true) {
-    const num = String(Math.floor(Math.random() * 90_000_000) + 10_000_000); // 8-digit, no leading 0
-    const exists = await Account.findOne({ accountNumber: num }).lean();
-    if (!exists) return num;
+function authUser(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'No token' });
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded; // { uid }
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid token' });
   }
 }
 
-async function createStarterAccounts(userId) {
-  const usd = await genUnique8();
-  const eur = await genUnique8();
-  await Account.insertMany([
-    { userId, currency: 'USD', accountNumber: usd, balance: 0 },
-    { userId, currency: 'EUR', accountNumber: eur, balance: 0 }
-  ]);
+function authAdmin(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'No token' });
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (!decoded.admin) throw new Error('not admin');
+    req.admin = decoded; // { aid, admin:true }
+    next();
+  } catch {
+    res.status(401).json({ error: 'Invalid admin token' });
+  }
 }
 
-// Auth middleware
-function auth(role) {
-  return (req, res, next) => {
-    const hdr = req.headers.authorization || '';
-    const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : '';
-    try {
-      const dec = jwt.verify(token, JWT_SECRET);
-      if (role && dec.role !== role) return res.status(403).send('Forbidden');
-      req.auth = dec; next();
-    } catch {
-      return res.status(401).send('Unauthorized');
-    }
-  };
+async function generateUniqueAccountNumber() {
+  // 8-digit, not starting with zero, ensure unique
+  let tries = 0;
+  while (tries < 20) {
+    const n = Math.floor(10000000 + Math.random() * 90000000).toString();
+    const exists = await User.findOne({ accountNumber: n }).lean();
+    if (!exists) return n;
+    tries++;
+  }
+  throw new Error('Failed to generate unique account number');
 }
 
-// ----------- ROUTES -----------
+/* ---------- Routes ---------- */
 
-// Health
-app.get('/api/health', (_req, res) => res.json({ ok: true }));
+// Health check for Render
+app.get('/api/health', (req, res) => res.json({ ok: true }));
 
-// ADMIN LOGIN
+/* ----- Admin seed (one-time) ----- */
+app.post('/api/admin/seed', async (req, res) => {
+  try {
+    const { username, password } = req.body || {};
+    if (!username || !password) return res.status(400).json({ error: 'username & password required' });
+    const exists = await Admin.findOne({ username });
+    if (exists) return res.json({ ok: true, note: 'Admin already exists' });
+    const passwordHash = await bcrypt.hash(password, 12);
+    await Admin.create({ username, passwordHash });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('seed error', e);
+    res.status(500).json({ error: 'seed failed' });
+  }
+});
+
+/* ----- Admin auth ----- */
 app.post('/api/admin/login', async (req, res) => {
   const { username, password } = req.body || {};
-  if (username !== ADMIN_USER || password !== ADMIN_PASS) {
-    return res.status(400).send('Invalid admin credentials');
-  }
-  return res.json({ token: tokenFor('admin', 'admin') });
+  const admin = await Admin.findOne({ username });
+  if (!admin) return res.status(401).json({ error: 'Invalid credentials' });
+  const ok = await bcrypt.compare(password, admin.passwordHash);
+  if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+  const token = signToken({ admin: true, aid: admin._id }, '12h');
+  res.json({ token });
 });
 
-// CLIENT REGISTRATION (sends OTP, stores temp)
+/* ----- Client: register (send OTP) ----- */
 app.post('/api/auth/register', async (req, res) => {
-  const { fullName, email, password, phone, address, govId } = req.body || {};
-  if (!fullName || !email || !password) return res.status(400).json({ message: 'Missing fields' });
+  try {
+    const { email, fullName, baseCurrency = 'USD' } = req.body || {};
+    if (!email || !fullName) return res.status(400).json({ error: 'Missing fields' });
 
-  const existing = await User.findOne({ email }).lean();
-  if (existing) return res.status(400).json({ message: 'Email already registered' });
+    let user = await User.findOne({ email });
+    if (!user) {
+      user = await User.create({ email, fullName, baseCurrency, kyc: { status: 'none' } });
+    }
 
-  const otp = genOTP(6);
-  const passwordHash = await bcrypt.hash(password, 10);
-  const tr = await TempReg.create({
-    fullName, email, passwordHash, phone, address, govId,
-    otp, otpExpires: new Date(Date.now() + 10 * 60 * 1000) // 10 min
-  });
+    // new OTP
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    user.otp = { code, expiresAt: new Date(Date.now() + 10 * 60 * 1000), purpose: 'register' };
+    await user.save();
 
-  await sendMail(email, 'Your Maltese First Capital OTP', `Your OTP is: ${otp}`);
-
-  return res.json({ regId: tr._id.toString() });
-});
-
-// VERIFY OTP → create User + starter accounts
-app.post('/api/auth/verify-otp', async (req, res) => {
-  const { regId, otp } = req.body || {};
-  const tr = await TempReg.findById(regId);
-  if (!tr) return res.status(400).json({ ok: false, message: 'Registration not found' });
-  if (tr.otp !== otp || tr.otpExpires < new Date()) {
-    return res.status(400).json({ ok: false, message: 'Invalid/expired OTP' });
+    await sendOtpEmail(email, code);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('register error', e);
+    res.status(500).json({ error: 'register failed' });
   }
-
-  const user = await User.create({
-    fullName: tr.fullName,
-    email: tr.email,
-    passwordHash: tr.passwordHash,
-    phone: tr.phone,
-    address: tr.address,
-    govId: tr.govId
-  });
-  await createStarterAccounts(user._id);
-  await TempReg.deleteOne({ _id: tr._id });
-
-  return res.json({ ok: true, userId: user._id.toString() });
 });
 
-// CLIENT LOGIN (step 1 → send OTP)
+/* ----- Client: verify OTP -> finalize account (with 8-digit #) ----- */
+app.post('/api/auth/verify-otp', async (req, res) => {
+  try {
+    const { email, code, password } = req.body || {};
+    const user = await User.findOne({ email });
+    if (!user || !user.otp) return res.status(400).json({ error: 'Invalid code' });
+    if (user.otp.purpose !== 'register') return res.status(400).json({ error: 'Wrong flow' });
+    if (user.otp.code !== code || new Date(user.otp.expiresAt) < new Date()) {
+      return res.status(400).json({ error: 'Invalid/expired code' });
+    }
+
+    // assign account number if missing
+    if (!user.accountNumber) {
+      user.accountNumber = await generateUniqueAccountNumber();
+    }
+    if (password) {
+      user.passwordHash = await bcrypt.hash(password, 12);
+    }
+    user.otp = undefined;
+    await user.save();
+
+    const token = signToken({ uid: user._id }, '7d');
+    res.json({
+      token,
+      user: {
+        id: user._id,
+        fullName: user.fullName,
+        email: user.email,
+        accountNumber: user.accountNumber,
+        baseCurrency: user.baseCurrency,
+        balance: user.balance,
+        statementNotes: user.statementNotes
+      }
+    });
+  } catch (e) {
+    console.error('verify error', e);
+    res.status(500).json({ error: 'verify failed' });
+  }
+});
+
+/* ----- Client: login ----- */
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body || {};
-  const u = await User.findOne({ email });
-  if (!u) return res.status(400).json({ message: 'Invalid credentials' });
-  const ok = await bcrypt.compare(password, u.passwordHash || '');
-  if (!ok) return res.status(400).json({ message: 'Invalid credentials' });
-
-  const otp = genOTP(6);
-  await Login2FA.create({
-    userId: u._id,
-    otp,
-    otpExpires: new Date(Date.now() + 10 * 60 * 1000)
-  });
-  await sendMail(u.email, 'Your login OTP', `Your OTP is: ${otp}`);
-
-  return res.json({ loginId: u._id.toString() }); // client will use /verify-2fa with this
-});
-
-// CLIENT LOGIN (step 2 → verify OTP & issue JWT)
-app.post('/api/auth/verify-2fa', async (req, res) => {
-  const { loginId, otp } = req.body || {};
-  const rec = await Login2FA.findOne({ userId: loginId }).sort({ createdAt: -1 });
-  if (!rec) return res.status(400).json({ message: 'No OTP pending' });
-  if (rec.otp !== otp || rec.otpExpires < new Date()) {
-    return res.status(400).json({ message: 'Invalid/expired OTP' });
-  }
-  await Login2FA.deleteMany({ userId: loginId });
-  return res.json({ token: tokenFor(loginId, 'client') });
-});
-
-// CLIENT DASHBOARD DATA
-app.get('/api/client/overview', auth('client'), async (req, res) => {
-  const userId = req.auth.sub;
-  const user = await User.findById(userId).lean();
-  const accts = await Account.find({ userId }).lean();
-  const tx = await Tx.find({ userId }).sort({ createdAt: -1 }).limit(50).lean();
-  res.json({ user, accounts: accts, transactions: tx });
-});
-
-// ADMIN: ADD TRANSACTION (credit/debit)
-app.post('/api/admin/tx', auth('admin'), async (req, res) => {
-  try {
-    const { userId, currency, type, amount, desc } = req.body || {};
-    if (!userId || !currency || !type || amount == null) {
-      return res.status(400).json({ message: 'Missing fields' });
+  const user = await User.findOne({ email });
+  if (!user || !user.passwordHash) return res.status(401).json({ error: 'Invalid credentials' });
+  const ok = await bcrypt.compare(password, user.passwordHash);
+  if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+  const token = signToken({ uid: user._id }, '7d');
+  res.json({
+    token,
+    user: {
+      id: user._id,
+      fullName: user.fullName,
+      email: user.email,
+      accountNumber: user.accountNumber,
+      baseCurrency: user.baseCurrency,
+      balance: user.balance,
+      statementNotes: user.statementNotes
     }
-    const val = Number(String(amount).replace(/,/g, ''));
-    if (Number.isNaN(val) || val <= 0) return res.status(400).json({ message: 'Invalid amount' });
-
-    const acct = await Account.findOne({ userId, currency });
-    if (!acct) return res.status(404).json({ message: 'Account not found' });
-
-    let newBal = acct.balance;
-    if (type === 'credit') newBal += val;
-    else if (type === 'debit') newBal -= val;
-    else return res.status(400).json({ message: 'Invalid type' });
-
-    acct.balance = newBal;
-    await acct.save();
-
-    const tx = await Tx.create({ userId, currency, type, amount: val, desc });
-    return res.json({ ok: true, tx });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// ----------- KYC (UploadThing URLs) -----------
-
-// Client sends UploadThing URLs + basic meta. Stored as 'pending' for admin review.
-app.post('/api/kyc/attach', async (req, res) => {
-  const { regId, userId, fullName, email, docType, docFrontUrl, docBackUrl, selfieUrl } = req.body || {};
-  if (!(regId || userId)) return res.status(400).json({ message: 'Missing regId or userId' });
-
-  const k = await KYC.create({
-    regId, userId, fullName, email, docType, docFrontUrl, docBackUrl, selfieUrl, status: 'pending'
   });
-  res.json({ ok: true, kycId: k._id.toString() });
 });
 
-// List pending for admin
-app.get('/api/admin/kyc/pending', auth('admin'), async (_req, res) => {
-  const list = await KYC.find({ status: 'pending' }).sort({ createdAt: 1 }).lean();
+/* ----- Client: me + transactions ----- */
+app.get('/api/user/me', authUser, async (req, res) => {
+  const u = await User.findById(req.user.uid).lean();
+  if (!u) return res.status(404).json({ error: 'Not found' });
+  res.json({
+    id: u._id,
+    fullName: u.fullName,
+    email: u.email,
+    accountNumber: u.accountNumber,
+    baseCurrency: u.baseCurrency,
+    balance: u.balance,
+    statementNotes: u.statementNotes,
+    kyc: u.kyc?.status || 'none'
+  });
+});
+
+app.get('/api/user/transactions', authUser, async (req, res) => {
+  const list = await Transaction.find({ userId: req.user.uid }).sort({ createdAt: -1 }).lean();
   res.json(list);
 });
 
-// Admin decision
-app.post('/api/admin/kyc/:kycId/decision', auth('admin'), async (req, res) => {
-  const { approve, notes } = req.body || {};
-  const k = await KYC.findById(req.params.kycId);
-  if (!k) return res.status(404).send('Not found');
+/* ----- KYC: submit (client) ----- */
+app.post('/api/kyc/submit', authUser, async (req, res) => {
+  const { items = [] } = req.body || {};
+  if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'No documents' });
 
-  k.status = approve ? 'approved' : 'rejected';
-  k.notes = notes || '';
-  k.decidedAt = new Date();
-  await k.save();
+  const sub = await KycSubmission.create({
+    userId: req.user.uid,
+    items,
+    status: 'submitted',
+    createdAt: new Date()
+  });
 
+  await User.findByIdAndUpdate(req.user.uid, { $set: { 'kyc.status': 'submitted' } });
+  res.json({ ok: true, id: sub._id });
+});
+
+/* ----- Admin: KYC queue / actions ----- */
+app.get('/api/admin/kyc', authAdmin, async (req, res) => {
+  const items = await KycSubmission.find({}).sort({ createdAt: -1 }).lean();
+  res.json(items);
+});
+
+app.post('/api/admin/kyc/:id/request-more', authAdmin, async (req, res) => {
+  const { id } = req.params;
+  const { notes } = req.body || {};
+  const sub = await KycSubmission.findById(id);
+  if (!sub) return res.status(404).json({ error: 'Not found' });
+  sub.status = 'needs-more';
+  sub.notes = notes || 'Please provide additional documentation.';
+  sub.updatedAt = new Date();
+  await sub.save();
+  await User.findByIdAndUpdate(sub.userId, { $set: { 'kyc.status': 'needs-more', 'kyc.adminNotes': sub.notes } });
   res.json({ ok: true });
 });
 
-// ----------- START -----------
-app.listen(PORT, () => {
-  console.log(`🚀 Server listening on :${PORT}`);
+app.post('/api/admin/kyc/:id/approve', authAdmin, async (req, res) => {
+  const { id } = req.params;
+  const sub = await KycSubmission.findById(id);
+  if (!sub) return res.status(404).json({ error: 'Not found' });
+  sub.status = 'approved';
+  sub.updatedAt = new Date();
+  await sub.save();
+  await User.findByIdAndUpdate(sub.userId, { $set: { 'kyc.status': 'approved' } });
+  res.json({ ok: true });
 });
+
+/* ----- Admin: transactions ----- */
+app.post('/api/admin/tx', authAdmin, async (req, res) => {
+  try {
+    const { userId, type, currency = 'USD', amount, description = '' } = req.body || {};
+    if (!userId || !type || !amount) return res.status(400).json({ error: 'Missing fields' });
+    const user = await User.findById(userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const tx = await Transaction.create({ userId, type, currency, amount, description });
+    // update balance
+    const delta = type === 'credit' ? amount : -amount;
+    user.balance = Number((user.balance + delta).toFixed(2));
+    await user.save();
+
+    res.json({ ok: true, tx });
+  } catch (e) {
+    console.error('tx add error', e);
+    res.status(500).json({ error: 'failed' });
+  }
+});
+
+app.put('/api/admin/tx/:id', authAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const tx = await Transaction.findById(id);
+    if (!tx) return res.status(404).json({ error: 'Not found' });
+
+    const { type, currency, amount, description } = req.body || {};
+    const user = await User.findById(tx.userId);
+    if (!user) return res.status(404).json({ error: 'User missing' });
+
+    // revert old delta
+    const oldDelta = tx.type === 'credit' ? tx.amount : -tx.amount;
+    user.balance = Number((user.balance - oldDelta).toFixed(2));
+
+    // apply new values
+    if (type) tx.type = type;
+    if (currency) tx.currency = currency;
+    if (typeof amount === 'number') tx.amount = amount;
+    if (typeof description === 'string') tx.description = description;
+    tx.editedAt = new Date();
+    await tx.save();
+
+    // apply new delta
+    const newDelta = tx.type === 'credit' ? tx.amount : -tx.amount;
+    user.balance = Number((user.balance + newDelta).toFixed(2));
+    await user.save();
+
+    res.json({ ok: true, tx });
+  } catch (e) {
+    console.error('tx edit error', e);
+    res.status(500).json({ error: 'failed' });
+  }
+});
+
+app.delete('/api/admin/tx/:id', authAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const tx = await Transaction.findById(id);
+    if (!tx) return res.status(404).json({ error: 'Not found' });
+    const user = await User.findById(tx.userId);
+    if (user) {
+      const delta = tx.type === 'credit' ? tx.amount : -tx.amount;
+      user.balance = Number((user.balance - delta).toFixed(2));
+      await user.save();
+    }
+    await tx.deleteOne();
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('tx delete error', e);
+    res.status(500).json({ error: 'failed' });
+  }
+});
+
+/* ----- Admin: statement text (per user) ----- */
+app.get('/api/admin/statement/:userId', authAdmin, async (req, res) => {
+  const u = await User.findById(req.params.userId).lean();
+  if (!u) return res.status(404).json({ error: 'User not found' });
+  res.json({ statementNotes: u.statementNotes || '' });
+});
+
+app.put('/api/admin/statement/:userId', authAdmin, async (req, res) => {
+  const { statementNotes = '' } = req.body || {};
+  await User.findByIdAndUpdate(req.params.userId, { $set: { statementNotes } });
+  res.json({ ok: true });
+});
+
+/* ---------- Start ---------- */
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`[API] listening on ${PORT}`));
