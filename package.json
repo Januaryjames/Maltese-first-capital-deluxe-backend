@@ -1,18 +1,15 @@
 {
-  "name": "maltese-first-capital-backend",
+  "name": "maltese-first-capital-deluxe-backend",
   "version": "1.0.0",
-  "description": "Maltese First Capital backend (OTP login, KYC docs, admin approvals)",
   "main": "server.js",
-  "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "bcryptjs": "2.4.3",
-    "cors": "2.8.5",
-    "express": "4.19.2",
-    "jsonwebtoken": "9.0.2",
-    "mongoose": "8.6.1",
-    "nodemailer": "6.9.14"
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mongoose": "^7.6.3",
+    "multer": "^1.4.5-lts.1"
   }
 }
