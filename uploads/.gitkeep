@@ -1,1 +1,11 @@
+# Node / dependencies
+node_modules/
+.env
 
+# Uploaded files
+uploads/*
+!uploads/.gitkeep
+
+# Logs
+*.log
+npm-debug.log*
