@@ -1,24 +1,36 @@
-const jwt = require('jsonwebtoken');
+// middleware/auth.js
+import jwt from "jsonwebtoken";
+import dotenv from "dotenv";
+dotenv.config();
 
-const JWT_SECRET = process.env.JWT_SECRET || 'change-me-in-render';
-
-function auth(requiredRole = null) {
-  return (req, res, next) => {
-    const hdr = req.headers.authorization || '';
-    const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
-    if (!token) return res.status(401).json({ error: 'Missing token' });
-
-    try {
-      const payload = jwt.verify(token, JWT_SECRET);
-      if (requiredRole && payload.role !== requiredRole) {
-        return res.status(403).json({ error: 'Forbidden' });
-      }
-      req.user = payload; // { id, role, email }
-      next();
-    } catch (e) {
-      return res.status(401).json({ error: 'Invalid token' });
-    }
-  };
+function getToken(req) {
+  const h = req.headers.authorization || "";
+  const parts = h.split(" ");
+  return parts.length === 2 ? parts[1] : null;
 }
 
-module.exports = { auth, JWT_SECRET };
+export function requireClient(req, res, next) {
+  try {
+    const token = getToken(req);
+    if (!token) return res.status(401).send("Unauthorized");
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    if (payload.role !== "client") return res.status(403).send("Forbidden");
+    req.user = payload;
+    next();
+  } catch {
+    return res.status(401).send("Unauthorized");
+  }
+}
+
+export function requireAdmin(req, res, next) {
+  try {
+    const token = getToken(req);
+    if (!token) return res.status(401).send("Unauthorized");
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    if (payload.role !== "admin") return res.status(403).send("Forbidden");
+    req.user = payload;
+    next();
+  } catch {
+    return res.status(401).send("Unauthorized");
+  }
+}
