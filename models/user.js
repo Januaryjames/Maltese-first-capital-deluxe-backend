@@ -1,13 +1,10 @@
-const mongoose = require('mongoose');
-
+// models/User.js
+import mongoose from "mongoose";
 const UserSchema = new mongoose.Schema({
-  fullName: { type: String, required: true },
-  email:    { type: String, required: true, unique: true, index: true },
-  passwordHash: { type: String, required: true },
-  accountNumber: { type: String, required: true, unique: true }, // 8 digits
-  // Simple profile fields you may expand later:
-  phone: String,
-  address: String
+  name: String,
+  email: { type: String, unique: true, index: true },
+  passwordHash: String,
+  role: { type: String, enum: ["admin", "client"], default: "client", index: true }
 }, { timestamps: true });
 
-module.exports = mongoose.model('User', UserSchema);
+export default mongoose.models.User || mongoose.model("User", UserSchema);
