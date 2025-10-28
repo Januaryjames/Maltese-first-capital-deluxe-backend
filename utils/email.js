@@ -1,45 +1,26 @@
-const nodemailer = require('nodemailer');
+// utils/email.js  (ESM)
+import nodemailer from "nodemailer";
+import dotenv from "dotenv";
+dotenv.config();
 
-const EMAIL_USER = process.env.EMAIL_USER; // hello@maltesefirst.com
-const EMAIL_PASS = process.env.EMAIL_PASS; // app password
+const transporter = nodemailer.createTransport({
+  host: process.env.MAIL_HOST,
+  port: Number(process.env.MAIL_PORT || 587),
+  secure: false,
+  auth: { user: process.env.MAIL_USER, pass: process.env.MAIL_PASS },
+});
 
-let transporter = null;
-
-function getTransporter() {
-  if (transporter) return transporter;
-  transporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: { user: EMAIL_USER, pass: EMAIL_PASS }
-  });
-  return transporter;
-}
-
-async function sendOtp(email, code) {
-  const t = getTransporter();
-  const html = `
-    <div style="font-family:system-ui,Segoe UI,Arial">
-      <h2>Maltese First Capital — Your OTP</h2>
-      <p>Your one-time code is:</p>
-      <p style="font-size:24px;font-weight:700;letter-spacing:3px">${code}</p>
-      <p>This code expires in 10 minutes.</p>
-    </div>`;
-  await t.sendMail({
-    from: `"Maltese First Capital" <${EMAIL_USER}>`,
-    to: email,
-    subject: 'Your One-Time Passcode',
-    html
+export async function sendEmail(to, subject, html) {
+  if (!process.env.MAIL_FROM) {
+    throw new Error("MAIL_FROM not set");
+  }
+  return transporter.sendMail({
+    from: process.env.MAIL_FROM,
+    to,
+    subject,
+    html,
   });
 }
 
-async function notifyDocStatus(email, status, filename) {
-  const t = getTransporter();
-  await t.sendMail({
-    from: `"Maltese First Capital" <${EMAIL_USER}>`,
-    to: email,
-    subject: `Document ${status}: ${filename}`,
-    text: `Your document "${filename}" was ${status}.`,
-    html: `<p>Your document "<b>${filename}</b>" was <b>${status}</b>.</p>`
-  });
-}
-
-module.exports = { sendOtp, notifyDocStatus };
+// optional: keep a default for flexibility
+export default sendEmail;
