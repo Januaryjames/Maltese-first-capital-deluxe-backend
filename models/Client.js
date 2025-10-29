@@ -1,22 +1,23 @@
-// models/Client.js
-const mongoose = require('mongoose');
+const { Schema, model } = require('mongoose');
 
-const BalanceSchema = new mongoose.Schema({
-  USD: { type: Number, default: 0 },
-  EUR: { type: Number, default: 0 },
-  // add more currencies as needed
-}, { _id: false });
-
-const ClientSchema = new mongoose.Schema({
-  fullName: { type: String, required: true },
-  email:    { type: String, required: true, index: true, unique: true },
-  phone:    { type: String },
+const ClientSchema = new Schema({
+  fullName: String,
+  email: { type: String, index: true },
+  phone: String,
   nationality: String,
   address: String,
   sourceOfFunds: String,
-  accountNumber: { type: String, unique: true, index: true }, // 8-digit
-  status: { type: String, enum: ['pending','approved','rejected'], default: 'pending' },
-  balances: { type: BalanceSchema, default: () => ({}) },
+  docs: {
+    passportUrl: String,
+    proofOfAddressUrl: String
+  },
+  accountNumber: { type: String, unique: true, index: true },
+  status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending', index: true },
+  balances: {
+    current: { type: Number, default: 0 },
+    savings: { type: Number, default: 0 },
+    investments: { type: Number, default: 0 }
+  }
 }, { timestamps: true });
 
-module.exports = mongoose.model('Client', ClientSchema);
+module.exports = model('Client', ClientSchema);
