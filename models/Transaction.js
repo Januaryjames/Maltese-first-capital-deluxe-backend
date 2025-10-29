@@ -1,10 +1,13 @@
 // models/Transaction.js
-import mongoose from "mongoose";
-const TxSchema = new mongoose.Schema({
-  accountNumber: { type: String, index: true },
-  type: { type: String, enum: ["credit", "debit"] },
-  amount: Number,
-  memo: String
+const mongoose = require('mongoose');
+const TransactionSchema = new mongoose.Schema({
+  client: { type: mongoose.Schema.Types.ObjectId, ref: 'Client', index: true },
+  date:   { type: Date, default: Date.now },
+  currency: { type: String, required: true },
+  amount:   { type: Number, required: true }, // +credit / -debit
+  type:     { type: String, enum: ['credit','debit'], required: true },
+  description: String,
+  balanceAfter: Number
 }, { timestamps: true });
 
-export default mongoose.models.Transaction || mongoose.model("Transaction", TxSchema);
+module.exports = mongoose.model('Transaction', TransactionSchema);
