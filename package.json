@@ -1,21 +1,20 @@
 {
-  "name": "maltese-first-capital-backend",
-  "version": "1.1.0",
+  "name": "maltese-first-capital-deluxe-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
   "main": "server.js",
-  "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "build": "echo \"no build step\"",
+    "dev": "NODE_ENV=development nodemon server.js"
   },
+  "engines": { "node": ">=18 <23" },
   "dependencies": {
-    "bcryptjs": "2.4.3",
-    "cors": "2.8.5",
-    "dotenv": "16.4.5",
-    "express": "4.19.2",
-    "express-rate-limit": "7.4.0",
-    "helmet": "7.1.0",
-    "jsonwebtoken": "9.0.2",
-    "mongoose": "8.6.0",
-    "multer": "1.4.5-lts.1",
-    "nodemailer": "6.9.14"
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.6.0"
   }
 }
