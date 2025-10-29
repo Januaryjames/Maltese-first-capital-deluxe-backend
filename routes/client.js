@@ -1,4 +1,47 @@
-// routes/client.js
+// routes/clients.js
+const express = require('express');
+const Client = require('../models/Client');
+const Tx = require('../models/Transaction');
+const generateAccountNumber = require('../utils/generateAccountNumber');
+const router = express.Router();
+
+/** KYC: create client (public) */
+router.post('/', async (req, res) => {
+  try {
+    const { fullName, email, phone, nationality, address, sourceOfFunds } = req.body;
+    const accountNumber = generateAccountNumber();
+    const client = await Client.create({ fullName, email, phone, nationality, address, sourceOfFunds, accountNumber });
+    res.status(201).json({ ok: true, clientId: client._id, accountNumber, status: client.status });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message });
+  }
+});
+
+/** Client summary (authed) */
+router.get('/:id/summary', async (req, res) => {
+  try {
+    const client = await Client.findById(req.params.id).lean();
+    if (!client) return res.status(404).json({ ok: false, error: 'Not found' });
+
+    const transactions = await Tx.find({ client: client._id })
+      .sort({ date: -1 }).limit(10).lean();
+
+    res.json({
+      ok: true,
+      client: {
+        fullName: client.fullName,
+        accountNumber: client.accountNumber,
+        status: client.status,
+        balances: client.balances
+      },
+      transactions
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+module.exports = router;// routes/client.js
 const express = require("express");
 const router = express.Router();
 const multer = require("multer");
