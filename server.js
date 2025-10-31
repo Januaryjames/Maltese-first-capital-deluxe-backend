@@ -1,5 +1,5 @@
-// server.js — Maltese First Capital API (v1.9.2)
-// Adds: CSP, strict MIME allow-list, SHA-256 file hashes, optional ClamAV scan.
+// server.js — Maltese First Capital API (v1.9.3)
+// Adds: alias /api/onboarding/account-open, CORS preflight, dual Turnstile field support.
 // Keeps: auth, Turnstile, onboarding, contact, admin apps, GridFS, accounts, email notify.
 
 require('dotenv').config();
@@ -56,8 +56,12 @@ app.set('trust proxy', 1);
 const ALLOWED = CORS_ORIGIN.split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
   origin: (origin, cb) => (!origin || ALLOWED.includes(origin)) ? cb(null, true) : cb(new Error('Not allowed by CORS')),
-  credentials: true
+  credentials: true,
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','X-Requested-With']
 }));
+// Preflight for all routes (important for multipart + custom headers)
+app.options('*', cors());
 
 // Helmet + CSP (allow Turnstile)
 app.use(helmet({
@@ -70,7 +74,7 @@ app.use(helmet({
       "frame-src": ["'self'", "https://challenges.cloudflare.com"],
       "img-src": ["'self'", "data:"],
       "style-src": ["'self'", "'unsafe-inline'"],
-      "connect-src": ["'self'", "https:"]
+      "connect-src": ["'self'", "https:"] // allows API calls over HTTPS
     }
   }
 }));
@@ -196,7 +200,7 @@ async function clamScan(buffer){
 const upload = multer({ storage: multer.memoryStorage(), limits:{ fileSize: 16*1024*1024 } });
 
 // ---- Routes ----
-app.get('/api/health', (_req,res)=> res.json({ ok:true, env:NODE_ENV, version:'1.9.2', uptime:process.uptime() }));
+app.get('/api/health', (_req,res)=> res.json({ ok:true, env:NODE_ENV, version:'1.9.3', uptime:process.uptime() }));
 
 // Auth
 app.post('/api/auth/login', async (req,res)=>{
@@ -238,14 +242,23 @@ app.post('/api/auth/reset', async (req,res)=>{
 // Onboarding (KYC)
 const ALLOWED_MIME = new Set(["application/pdf","image/jpeg","image/png","image/webp"]);
 
-app.post('/api/onboarding/submit',
-  upload.fields([{name:'passport',maxCount:1},{name:'proofOfAddress',maxCount:1},{name:'companyDocs',maxCount:20},{name:'selfie',maxCount:1}]),
-  async (req,res)=>{
-    // Turnstile check (body field from hidden input)
-    const ok = await verifyTurnstile(req.body?.['cf_turnstile_response'] || '', req.ip);
+// shared handler + upload fields so we can mount two routes
+const kycUpload = upload.fields([
+  {name:'passport',maxCount:1},
+  {name:'proofOfAddress',maxCount:1},
+  {name:'companyDocs',maxCount:20},
+  {name:'selfie',maxCount:1}
+]);
+
+async function onboardingHandler(req,res){
+  try{
+    // Turnstile check (accept underscore OR hyphen names)
+    const tsToken = req.body?.['cf_turnstile_response'] || req.body?.['cf-turnstile-response'] || '';
+    const ok = await verifyTurnstile(tsToken, req.ip);
     if(!ok) return res.status(400).json({error:'Captcha verification failed'});
 
-    const gfs=getGridFSBucket();
+    const gfs = getGridFSBucket();
+
     async function save(field){
       const arr=req.files?.[field]||[]; const out=[];
       for(const f of arr){
@@ -254,7 +267,6 @@ app.post('/api/onboarding/submit',
         }
         const sha256 = createHash('sha256').update(f.buffer).digest('hex');
         const av = await clamScan(f.buffer); // may skip if not configured
-
         const filename=`${Date.now()}_${f.originalname}`;
         const us=gfs.openUploadStream(filename,{contentType:f.mimetype}); us.end(f.buffer);
         const fin=await new Promise((resolve,reject)=>{ us.on('finish',resolve); us.on('error',reject); });
@@ -263,12 +275,19 @@ app.post('/api/onboarding/submit',
       return out;
     }
 
-    const [passport,proofOfAddress,companyDocs,selfie]=await Promise.all([save('passport'),save('proofOfAddress'),save('companyDocs'),save('selfie')]);
+    const [passport,proofOfAddress,companyDocs,selfie]=await Promise.all([
+      save('passport'), save('proofOfAddress'), save('companyDocs'), save('selfie')
+    ]);
+
     const { fullName,email,phone,companyName,country }=req.body||{};
     const applicationId = randomUUID();
 
-    const doc = await Application.create({ applicationId, status:'received',
-      fields:{fullName,email,phone,companyName,country}, files:{passport,proofOfAddress,companyDocs,selfie}, submittedByIp:req.ip });
+    const doc = await Application.create({
+      applicationId, status:'received',
+      fields:{fullName,email,phone,companyName,country},
+      files:{passport,proofOfAddress,companyDocs,selfie},
+      submittedByIp:req.ip
+    });
 
     // Notify ops (optional)
     sendNotify('New Account Application', `
@@ -279,13 +298,21 @@ app.post('/api/onboarding/submit',
          <b>Country:</b> ${country||'-'}</p>
     `).catch(()=>{});
 
-    res.json({ applicationId:doc.applicationId, status:doc.status, receivedAt:doc.createdAt });
+    return res.status(202).json({ applicationId:doc.applicationId, status:doc.status, receivedAt:doc.createdAt });
+  }catch(e){
+    console.error('onboarding submit error:', e);
+    return res.status(500).json({ error:'Server error' });
   }
-);
+}
+
+// Mount both routes (alias)
+app.post('/api/onboarding/submit', kycUpload, onboardingHandler);
+app.post('/api/onboarding/account-open', kycUpload, onboardingHandler);
 
 // Contact
 app.post('/api/contact', upload.none(), async (req,res)=>{
-  const ok = await verifyTurnstile(req.body?.['cf_turnstile_response'] || '', req.ip);
+  const tsToken = req.body?.['cf_turnstile_response'] || req.body?.['cf-turnstile-response'] || '';
+  const ok = await verifyTurnstile(tsToken, req.ip);
   if(!ok) return res.status(400).json({error:'Captcha verification failed'});
   const { name='', email='', phone='', subject='', message='' } = req.body||{};
   await ContactMessage.create({ name, email, phone, subject, message, meta:{ userAgent:req.headers['user-agent']||'', ip:req.ip } });
@@ -340,7 +367,7 @@ app.post('/api/admin/dev-seed-account', async (req,res)=>{
     });
   }
 
-  const accountNo = String(Math.floor(10_000_000 + Math.random()*90_000_000));
+  const accountNo = genAccountNo();
   const when = ts ? new Date(ts) : new Date();
   const acct = await Account.create({
     accountNo, owner: user._id, status, currency,
