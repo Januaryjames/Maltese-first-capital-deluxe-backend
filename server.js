@@ -1,4 +1,7 @@
-// server.js
+// server.js — Maltese First Capital API (drop-in)
+// Features: Mongo+Mongoose, GridFS file storage, JWT auth, Turnstile verification,
+// rate limits, Helmet, CORS. No UI dependencies.
+
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -8,34 +11,33 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
-const fetch = require('node-fetch');
-
-const { connectMongo, getGridFSBucket, shutdown } = require('./db');
-const User = require('./models/User');
-const Application = require('./models/Application');
-const ResetToken = require('./models/ResetToken');
+const fetch = require('node-fetch'); // v2 API
+const mongoose = require('mongoose');
+const { MongoClient, GridFSBucket } = require('mongodb');
 
 const {
   PORT = 8080,
+  NODE_ENV = 'production',
+  MONGODB_URI,
   JWT_SECRET = 'change_me',
   CORS_ORIGIN = 'https://maltesefirst.com',
   TURNSTILE_SECRET,
-  MONGODB_URI,
   DEV_SEED_KEY
 } = process.env;
 
 if (!MONGODB_URI) throw new Error('MONGODB_URI missing');
-if (!TURNSTILE_SECRET) console.warn('WARNING: TURNSTILE_SECRET is not set. Turnstile will fail.');
+if (!TURNSTILE_SECRET) console.warn('WARNING: TURNSTILE_SECRET is not set');
 
+// ---------- Express app ----------
 const app = express();
+app.set('trust proxy', 1); // accurate req.ip behind CF/Render
 
-// Security middleware
-app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors({ origin: CORS_ORIGIN, credentials: true }));
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 
-// Rate limit
+// 10-min window, 100 requests on /api/*
 app.use('/api/', rateLimit({
   windowMs: 10 * 60 * 1000,
   max: 100,
@@ -43,39 +45,85 @@ app.use('/api/', rateLimit({
   legacyHeaders: false
 }));
 
-// Health endpoint
-app.get('/api/health', (req, res) => {
-  res.json({ ok: true, version: '1.1.0', uptime: process.uptime() });
-});
+// ---------- Mongo (Mongoose + GridFS) ----------
+let gfsBucket = null;
+let nativeClient = null;
 
-// JWT helpers
-function makeToken(user) {
-  return jwt.sign({ sub: user.id, role: user.role, name: user.name }, JWT_SECRET, { expiresIn: '1h' });
+async function connectMongo(uri) {
+  await mongoose.connect(uri, { maxPoolSize: 20 });
+  nativeClient = new MongoClient(uri);
+  await nativeClient.connect();
+  const dbName = mongoose.connection.client.s.options.dbName || mongoose.connection.name;
+  gfsBucket = new GridFSBucket(nativeClient.db(dbName), { bucketName: 'uploads' });
+  console.log('Mongo connected:', dbName);
+}
+
+function getGridFSBucket() {
+  if (!gfsBucket) throw new Error('GridFS not ready');
+  return gfsBucket;
+}
+
+async function shutdown() {
+  await mongoose.disconnect().catch(()=>{});
+  if (nativeClient) await nativeClient.close().catch(()=>{});
+}
+
+// ---------- Schemas (inline) ----------
+const User = mongoose.model('User', new mongoose.Schema({
+  email: { type: String, unique: true, index: true, required: true, lowercase: true, trim: true },
+  passwordHash: { type: String, required: true },
+  role: { type: String, enum: ['client','admin'], default: 'client', index: true },
+  name: { type: String, trim: true }
+}, { timestamps: true }));
+
+const FileMetaSchema = new mongoose.Schema({
+  gridfsId: mongoose.Schema.Types.ObjectId,
+  filename: String,
+  mime: String,
+  size: Number
+}, { _id: false });
+
+const Application = mongoose.model('Application', new mongoose.Schema({
+  applicationId: { type: String, unique: true, index: true },
+  status: { type: String, enum: ['received','review','approved','rejected'], default: 'received' },
+  fields: { fullName:String, email:String, phone:String, companyName:String, country:String },
+  files: { passport:[FileMetaSchema], proofOfAddress:[FileMetaSchema], companyDocs:[FileMetaSchema], selfie:[FileMetaSchema] },
+  submittedByIp: String
+}, { timestamps: true }));
+
+const ResetToken = mongoose.model('ResetToken', new mongoose.Schema({
+  email: { type: String, index: true, required: true, lowercase: true, trim: true },
+  token: { type: String, required: true, unique: true },
+  used: { type: Boolean, default: false },
+  expiresAt: { type: Date, index: true }
+}, { timestamps: true }));
+
+// ---------- Helpers ----------
+function makeToken(u) {
+  return jwt.sign({ sub: u.id, role: u.role, name: u.name }, JWT_SECRET, { expiresIn: '1h' });
 }
 function authRequired(role) {
   return (req, res, next) => {
     const hdr = req.headers.authorization || '';
-    const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
-    if (!token) return res.status(401).json({ error: 'Missing token' });
+    const t = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
+    if (!t) return res.status(401).json({ error: 'Missing token' });
     try {
-      const payload = jwt.verify(token, JWT_SECRET);
-      if (role && payload.role !== role) return res.status(403).json({ error: 'Forbidden' });
-      req.user = payload;
+      const p = jwt.verify(t, JWT_SECRET);
+      if (role && p.role !== role) return res.status(403).json({ error: 'Forbidden' });
+      req.user = p;
       next();
     } catch {
       return res.status(401).json({ error: 'Invalid token' });
     }
   };
 }
-
-// Turnstile verification
-async function verifyTurnstile(token, remoteip) {
+async function verifyTurnstile(token, ip) {
   if (!TURNSTILE_SECRET) return false;
   try {
     const resp = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: `secret=${encodeURIComponent(TURNSTILE_SECRET)}&response=${encodeURIComponent(token)}&remoteip=${encodeURIComponent(remoteip || '')}`
+      body: `secret=${encodeURIComponent(TURNSTILE_SECRET)}&response=${encodeURIComponent(token || '')}&remoteip=${encodeURIComponent(ip || '')}`
     });
     const data = await resp.json();
     return !!data.success;
@@ -83,57 +131,66 @@ async function verifyTurnstile(token, remoteip) {
     return false;
   }
 }
+async function requireTurnstile(req, res, next) {
+  const ok = await verifyTurnstile(req.body?.['cf_turnstile_response'], req.ip);
+  if (!ok) return res.status(400).json({ error: 'Captcha verification failed' });
+  next();
+}
 
-// Multer (memory) → GridFS
+// Multer: in-memory; 8MB per file
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } });
 
-// AUTH: client login
+// ---------- Routes ----------
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true, env: NODE_ENV, version: '1.4.0', uptime: process.uptime() });
+});
+
+// Auth (client)
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body || {};
-  const user = await User.findOne({ email: (email||'').toLowerCase(), role: 'client' });
-  if (!user) return res.status(400).json({ error: 'Invalid credentials' });
-  const ok = await bcrypt.compare(password || '', user.passwordHash);
+  const u = await User.findOne({ email: (email||'').toLowerCase(), role: 'client' });
+  if (!u) return res.status(400).json({ error: 'Invalid credentials' });
+  const ok = await bcrypt.compare(password || '', u.passwordHash);
   if (!ok) return res.status(400).json({ error: 'Invalid credentials' });
-  return res.json({ token: makeToken(user), user: { id: user.id, name: user.name, role: user.role } });
+  return res.json({ token: makeToken(u), user: { id: u.id, name: u.name, role: u.role } });
 });
 
-// AUTH: admin login
+// Auth (admin)
 app.post('/api/admin/login', async (req, res) => {
   const { email, password } = req.body || {};
-  const user = await User.findOne({ email: (email||'').toLowerCase(), role: 'admin' });
-  if (!user) return res.status(400).json({ error: 'Invalid credentials' });
-  const ok = await bcrypt.compare(password || '', user.passwordHash);
+  const u = await User.findOne({ email: (email||'').toLowerCase(), role: 'admin' });
+  if (!u) return res.status(400).json({ error: 'Invalid credentials' });
+  const ok = await bcrypt.compare(password || '', u.passwordHash);
   if (!ok) return res.status(400).json({ error: 'Invalid credentials' });
-  return res.json({ token: makeToken(user), user: { id: user.id, name: user.name, role: user.role } });
+  return res.json({ token: makeToken(u), user: { id: u.id, name: u.name, role: u.role } });
 });
 
-// Password reset request (persists token)
+// Password reset (request)
 app.post('/api/auth/request-reset', async (req, res) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Email required' });
-  const expires = new Date(Date.now() + 1000 * 60 * 30); // 30 mins
   const token = uuidv4().replace(/-/g, '');
+  const expires = new Date(Date.now() + 30 * 60 * 1000); // 30 mins
   await ResetToken.create({ email: email.toLowerCase(), token, expiresAt: expires });
-  // TODO: email the token/link to user
+  // TODO: send email containing token link
   return res.status(204).end();
 });
 
-// Password reset confirm
+// Password reset (confirm)
 app.post('/api/auth/reset', async (req, res) => {
   const { token, newPassword } = req.body || {};
   if (!token || !newPassword) return res.status(400).json({ error: 'Token and newPassword required' });
-  const found = await ResetToken.findOne({ token, used: false, expiresAt: { $gt: new Date() } });
-  if (!found) return res.status(400).json({ error: 'Invalid or expired token' });
-  const user = await User.findOne({ email: found.email });
-  if (!user) return res.status(400).json({ error: 'No account for token' });
-  user.passwordHash = await bcrypt.hash(newPassword, 10);
-  await user.save();
-  found.used = true;
-  await found.save();
+  const rt = await ResetToken.findOne({ token, used: false, expiresAt: { $gt: new Date() } });
+  if (!rt) return res.status(400).json({ error: 'Invalid or expired token' });
+  const u = await User.findOne({ email: rt.email });
+  if (!u) return res.status(400).json({ error: 'No account for token' });
+  u.passwordHash = await bcrypt.hash(newPassword, 10);
+  await u.save();
+  rt.used = true; await rt.save();
   return res.status(204).end();
 });
 
-// Onboarding submit (multipart + GridFS + Turnstile)
+// KYC / Account open (multipart + Turnstile + GridFS)
 app.post('/api/onboarding/submit',
   upload.fields([
     { name: 'passport', maxCount: 1 },
@@ -141,40 +198,28 @@ app.post('/api/onboarding/submit',
     { name: 'companyDocs', maxCount: 10 },
     { name: 'selfie', maxCount: 1 }
   ]),
+  requireTurnstile,
   async (req, res) => {
-    const remoteip = req.ip;
-    const turnstileToken = req.body['cf_turnstile_response'];
-    const okCaptcha = await verifyTurnstile(turnstileToken, remoteip);
-    if (!okCaptcha) return res.status(400).json({ error: 'Captcha verification failed' });
-
     const gfs = getGridFSBucket();
 
-    async function saveFiles(fieldName) {
-      const arr = req.files?.[fieldName] || [];
+    async function save(field) {
+      const files = req.files?.[field] || [];
       const out = [];
-      for (const f of arr) {
+      for (const f of files) {
         const filename = `${Date.now()}_${f.originalname}`;
-        const uploadStream = gfs.openUploadStream(filename, { contentType: f.mimetype });
-        uploadStream.end(f.buffer);
-        const finished = await new Promise((resolve, reject) => {
-          uploadStream.on('finish', resolve);
-          uploadStream.on('error', reject);
+        const us = gfs.openUploadStream(filename, { contentType: f.mimetype });
+        us.end(f.buffer);
+        const fin = await new Promise((resolve, reject) => {
+          us.on('finish', resolve);
+          us.on('error', reject);
         });
-        out.push({
-          gridfsId: finished._id,
-          filename,
-          mime: f.mimetype,
-          size: f.size
-        });
+        out.push({ gridfsId: fin._id, filename, mime: f.mimetype, size: f.size });
       }
       return out;
     }
 
     const [passport, proofOfAddress, companyDocs, selfie] = await Promise.all([
-      saveFiles('passport'),
-      saveFiles('proofOfAddress'),
-      saveFiles('companyDocs'),
-      saveFiles('selfie')
+      save('passport'), save('proofOfAddress'), save('companyDocs'), save('selfie')
     ]);
 
     const { fullName, email, phone, companyName, country } = req.body;
@@ -185,73 +230,58 @@ app.post('/api/onboarding/submit',
       status: 'received',
       fields: { fullName, email, phone, companyName, country },
       files: { passport, proofOfAddress, companyDocs, selfie },
-      submittedByIp: remoteip
+      submittedByIp: req.ip
     });
 
-    return res.json({
-      applicationId: doc.applicationId,
-      status: doc.status,
-      receivedAt: doc.createdAt
-    });
+    res.json({ applicationId: doc.applicationId, status: doc.status, receivedAt: doc.createdAt });
   }
 );
 
-// Example protected client endpoint
-app.get('/api/client/overview', authRequired('client'), async (req, res) => {
-  // TODO: pull accounts from DB; static sample for now
+// Example protected endpoints
+app.get('/api/client/overview', authRequired('client'), async (_req, res) => {
   res.json({
     accounts: [
-      { id: 'ACC-USD-001', currency: 'USD', balance: 5000000.00 },
-      { id: 'ACC-EUR-002', currency: 'EUR', balance: 1250000.00 }
+      { id: 'ACC-USD-001', currency: 'USD', balance: 5000000 },
+      { id: 'ACC-EUR-002', currency: 'EUR', balance: 1250000 }
     ]
   });
 });
 
-// Admin views
-app.get('/api/admin/applications', authRequired('admin'), async (req, res) => {
+app.get('/api/admin/applications', authRequired('admin'), async (_req, res) => {
   const items = await Application.find().sort({ createdAt: -1 }).limit(100);
   res.json({ items });
 });
 
-app.post('/api/admin/applications/:id/decision', authRequired('admin'), async (req, res) => {
-  // TODO: add body {decision:"approved"|"rejected"}
+app.post('/api/admin/applications/:id/decision', authRequired('admin'), async (_req, res) => {
+  // TODO: approve/reject body {decision:'approved'|'rejected'}
   res.status(204).end();
 });
 
-// Minimal seeder (one-shot) to create demo client/admin
+// One-time seed: create demo admin/client
 app.post('/api/dev/seed-admin', async (req, res) => {
   const key = req.headers['x-seed-key'];
   if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error: 'Forbidden' });
 
-  const ensure = async (email, password, role, name) => {
+  async function ensure(email, password, role, name) {
     let u = await User.findOne({ email });
-    if (!u) {
-      u = await User.create({
-        email,
-        passwordHash: await bcrypt.hash(password, 10),
-        role,
-        name
-      });
-    }
+    if (!u) u = await User.create({ email, passwordHash: await bcrypt.hash(password, 10), role, name });
     return u;
-  };
-
+  }
   const client = await ensure('client@example.com', 'client123', 'client', 'Demo Client');
   const admin  = await ensure('admin@example.com',  'admin123',  'admin',  'Demo Admin');
-
   res.json({ ok: true, client: client.email, admin: admin.email });
 });
 
-// Start/Stop
+// ---------- Boot ----------
 (async () => {
   try {
     await connectMongo(MONGODB_URI);
     app.listen(PORT, () => console.log(`API listening on :${PORT}`));
-    const handle = async () => { await shutdown(); process.exit(0); };
-    process.on('SIGINT', handle);
-    process.on('SIGTERM', handle);
-  } catch (err) {
-    console.error('Boot error:', err);
+    const stop = async () => { await shutdown(); process.exit(0); };
+    process.on('SIGINT', stop);
+    process.on('SIGTERM', stop);
+  } catch (e) {
+    console.error('Boot error:', e);
     process.exit(1);
   }
 })();
