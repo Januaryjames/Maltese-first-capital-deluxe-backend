@@ -1,7 +1,4 @@
-// server.js — Maltese First Capital API (drop-in)
-// Features: Mongo+Mongoose, GridFS file storage, JWT auth, Turnstile verification,
-// rate limits, Helmet, CORS. No UI dependencies.
-
+// server.js — Maltese First Capital API (Turnstile + Mongo + GridFS + JWT)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -11,7 +8,6 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
-const fetch = require('node-fetch'); // v2 API
 const mongoose = require('mongoose');
 const { MongoClient, GridFSBucket } = require('mongodb');
 
@@ -28,22 +24,14 @@ const {
 if (!MONGODB_URI) throw new Error('MONGODB_URI missing');
 if (!TURNSTILE_SECRET) console.warn('WARNING: TURNSTILE_SECRET is not set');
 
-// ---------- Express app ----------
+// ---------- Express ----------
 const app = express();
 app.set('trust proxy', 1); // accurate req.ip behind CF/Render
-
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors({ origin: CORS_ORIGIN, credentials: true }));
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
-
-// 10-min window, 100 requests on /api/*
-app.use('/api/', rateLimit({
-  windowMs: 10 * 60 * 1000,
-  max: 100,
-  standardHeaders: true,
-  legacyHeaders: false
-}));
+app.use('/api/', rateLimit({ windowMs: 10 * 60 * 1000, max: 100, standardHeaders: true, legacyHeaders: false }));
 
 // ---------- Mongo (Mongoose + GridFS) ----------
 let gfsBucket = null;
@@ -68,7 +56,7 @@ async function shutdown() {
   if (nativeClient) await nativeClient.close().catch(()=>{});
 }
 
-// ---------- Schemas (inline) ----------
+// ---------- Schemas ----------
 const User = mongoose.model('User', new mongoose.Schema({
   email: { type: String, unique: true, index: true, required: true, lowercase: true, trim: true },
   passwordHash: { type: String, required: true },
@@ -117,6 +105,8 @@ function authRequired(role) {
     }
   };
 }
+
+// Use native fetch (Node 18+)
 async function verifyTurnstile(token, ip) {
   if (!TURNSTILE_SECRET) return false;
   try {
@@ -137,12 +127,12 @@ async function requireTurnstile(req, res, next) {
   next();
 }
 
-// Multer: in-memory; 8MB per file
+// Multer: in-memory; 8MB/file
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } });
 
 // ---------- Routes ----------
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, env: NODE_ENV, version: '1.4.0', uptime: process.uptime() });
+  res.json({ ok: true, env: NODE_ENV, version: '1.4.1', uptime: process.uptime() });
 });
 
 // Auth (client)
@@ -170,9 +160,9 @@ app.post('/api/auth/request-reset', async (req, res) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Email required' });
   const token = uuidv4().replace(/-/g, '');
-  const expires = new Date(Date.now() + 30 * 60 * 1000); // 30 mins
+  const expires = new Date(Date.now() + 30 * 60 * 1000);
   await ResetToken.create({ email: email.toLowerCase(), token, expiresAt: expires });
-  // TODO: send email containing token link
+  // TODO: send email with token link
   return res.status(204).end();
 });
 
@@ -253,11 +243,10 @@ app.get('/api/admin/applications', authRequired('admin'), async (_req, res) => {
 });
 
 app.post('/api/admin/applications/:id/decision', authRequired('admin'), async (_req, res) => {
-  // TODO: approve/reject body {decision:'approved'|'rejected'}
   res.status(204).end();
 });
 
-// One-time seed: create demo admin/client
+// Seed demo users once
 app.post('/api/dev/seed-admin', async (req, res) => {
   const key = req.headers['x-seed-key'];
   if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error: 'Forbidden' });
