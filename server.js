@@ -1,17 +1,4 @@
-// server.js — Maltese First Capital API
-// Features: Mongo + Mongoose + GridFS, JWT auth, Turnstile verification, rate limits,
-// multi-origin CORS, Contact endpoint, KYC uploads, Admin list+detail+file download.
-// Uses Node's built-in `fetch` and `crypto.randomUUID` (no extra deps).
-//
-// ENV (Render):
-// PORT=8080
-// NODE_ENV=production
-// MONGODB_URI=your_mongo_uri
-// JWT_SECRET=change_me_in_prod
-// CORS_ORIGIN=https://maltesefirst.com,https://www.maltesefirst.com
-// TURNSTILE_SECRET=0x_your_secret_key
-// DEV_SEED_KEY=choose_a_long_random_key
-
+// server.js — Maltese First Capital API (v1.7.0)
 require('dotenv').config();
 const express = require('express');
 const helmet = require('helmet');
@@ -29,57 +16,41 @@ const {
   NODE_ENV = 'production',
   MONGODB_URI,
   JWT_SECRET = 'change_me',
-  CORS_ORIGIN = 'https://maltesefirst.com',
+  CORS_ORIGIN = 'https://maltesefirst.com,https://www.maltesefirst.com',
   TURNSTILE_SECRET,
   DEV_SEED_KEY
 } = process.env;
 
 if (!MONGODB_URI) throw new Error('MONGODB_URI missing');
-if (!TURNSTILE_SECRET) console.warn('WARNING: TURNSTILE_SECRET is not set');
+if (!TURNSTILE_SECRET) console.warn('WARNING: TURNSTILE_SECRET not set');
 
-// ---------- App ----------
+// ---- App ----
 const app = express();
 app.set('trust proxy', 1);
-
 const ALLOWED = CORS_ORIGIN.split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);
-    if (ALLOWED.includes(origin)) return cb(null, true);
-    return cb(new Error('Not allowed by CORS'));
-  },
+  origin: (origin, cb) => (!origin || ALLOWED.includes(origin)) ? cb(null, true) : cb(new Error('Not allowed by CORS')),
   credentials: true
 }));
-
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 app.use('/api/', rateLimit({ windowMs: 10 * 60 * 1000, max: 100, standardHeaders: true, legacyHeaders: false }));
 
-// ---------- Mongo + GridFS ----------
-let gfsBucket = null;
-let nativeClient = null;
-
+// ---- Mongo + GridFS ----
+let gfsBucket = null, nativeClient = null;
 async function connectMongo(uri) {
   await mongoose.connect(uri, { maxPoolSize: 20 });
   nativeClient = new MongoClient(uri);
   await nativeClient.connect();
-  const dbName = mongoose.connection.client.s?.options?.dbName || mongoose.connection.name;
+  const dbName = mongoose.connection.name;
   gfsBucket = new GridFSBucket(nativeClient.db(dbName), { bucketName: 'uploads' });
   console.log('Mongo connected:', dbName);
 }
+function getGridFSBucket(){ if (!gfsBucket) throw new Error('GridFS not ready'); return gfsBucket; }
+async function shutdown(){ await mongoose.disconnect().catch(()=>{}); if (nativeClient) await nativeClient.close().catch(()=>{}); }
 
-function getGridFSBucket() {
-  if (!gfsBucket) throw new Error('GridFS not ready');
-  return gfsBucket;
-}
-
-async function shutdown() {
-  await mongoose.disconnect().catch(() => {});
-  if (nativeClient) await nativeClient.close().catch(() => {});
-}
-
-// ---------- Schemas ----------
+// ---- Schemas ----
 const User = mongoose.model('User', new mongoose.Schema({
   email: { type: String, unique: true, index: true, required: true, lowercase: true, trim: true },
   passwordHash: { type: String, required: true },
@@ -89,9 +60,7 @@ const User = mongoose.model('User', new mongoose.Schema({
 
 const FileMetaSchema = new mongoose.Schema({
   gridfsId: mongoose.Schema.Types.ObjectId,
-  filename: String,
-  mime: String,
-  size: Number
+  filename: String, mime: String, size: Number
 }, { _id: false });
 
 const Application = mongoose.model('Application', new mongoose.Schema({
@@ -114,222 +83,208 @@ const ContactMessage = mongoose.model('ContactMessage', new mongoose.Schema({
   meta:{ userAgent:String, ip:String }
 }, { timestamps: true }));
 
-// ---------- Helpers ----------
-function makeToken(u) {
-  return jwt.sign({ sub: u.id, role: u.role, name: u.name }, JWT_SECRET, { expiresIn: '1h' });
-}
-function authRequired(role) {
-  return (req, res, next) => {
+// ---- Helpers ----
+function makeToken(u){ return jwt.sign({ sub: u.id, role: u.role, name: u.name }, JWT_SECRET, { expiresIn: '1h' }); }
+function authRequired(role){
+  return (req,res,next)=>{
     const hdr = req.headers.authorization || '';
     const t = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
     if (!t) return res.status(401).json({ error: 'Missing token' });
     try {
       const p = jwt.verify(t, JWT_SECRET);
       if (role && p.role !== role) return res.status(403).json({ error: 'Forbidden' });
-      req.user = p;
-      next();
-    } catch {
-      return res.status(401).json({ error: 'Invalid token' });
-    }
+      req.user = p; next();
+    } catch { return res.status(401).json({ error: 'Invalid token' }); }
   };
 }
-async function verifyTurnstile(token, ip) {
+async function verifyTurnstile(token, ip){
   if (!TURNSTILE_SECRET) return false;
   try {
-    const resp = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: `secret=${encodeURIComponent(TURNSTILE_SECRET)}&response=${encodeURIComponent(token || '')}&remoteip=${encodeURIComponent(ip || '')}`
+    const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method:'POST', headers:{'content-type':'application/x-www-form-urlencoded'},
+      body:`secret=${encodeURIComponent(TURNSTILE_SECRET)}&response=${encodeURIComponent(token||'')}&remoteip=${encodeURIComponent(ip||'')}`
     });
-    const data = await resp.json();
-    return !!data.success;
-  } catch {
-    return false;
-  }
+    const d = await r.json();
+    return !!d.success;
+  } catch { return false; }
 }
-async function requireTurnstile(req, res, next) {
+async function requireTurnstile(req,res,next){
   const ok = await verifyTurnstile(req.body?.['cf_turnstile_response'], req.ip);
   if (!ok) return res.status(400).json({ error: 'Captcha verification failed' });
   next();
 }
-function tryObjectId(str) {
-  try { return new mongoose.Types.ObjectId(str); } catch { return null; }
-}
+function tryObjectId(str){ try { return new mongoose.Types.ObjectId(str); } catch { return null; } }
 
-// Multer: in-memory; 16MB per file (company packs can be large)
+// ---- Multer ----
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 16 * 1024 * 1024 } });
 
-// ---------- Routes ----------
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, env: NODE_ENV, version: '1.6.0', uptime: process.uptime() });
+// ---- Routes ----
+app.get('/api/health', (_req,res)=> res.json({ ok:true, env:NODE_ENV, version:'1.7.0', uptime:process.uptime() }));
+
+// Auth: client login
+app.post('/api/auth/login', async (req,res)=>{
+  const { email, password } = req.body || {};
+  const u = await User.findOne({ email:(email||'').toLowerCase(), role:'client' });
+  if (!u) return res.status(400).json({ error: 'Invalid credentials' });
+  const ok = await bcrypt.compare(password||'', u.passwordHash);
+  if (!ok) return res.status(400).json({ error: 'Invalid credentials' });
+  res.json({ token: makeToken(u), user:{ id:u.id, name:u.name, role:u.role } });
 });
 
-// Auth (client)
-app.post('/api/auth/login', async (req, res) => {
+// Auth: admin login
+app.post('/api/admin/login', async (req,res)=>{
   const { email, password } = req.body || {};
-  const u = await User.findOne({ email: (email||'').toLowerCase(), role: 'client' });
+  const u = await User.findOne({ email:(email||'').toLowerCase(), role:'admin' });
   if (!u) return res.status(400).json({ error: 'Invalid credentials' });
-  const ok = await bcrypt.compare(password || '', u.passwordHash);
+  const ok = await bcrypt.compare(password||'', u.passwordHash);
   if (!ok) return res.status(400).json({ error: 'Invalid credentials' });
-  return res.json({ token: makeToken(u), user: { id: u.id, name: u.name, role: u.role } });
+  res.json({ token: makeToken(u), user:{ id:u.id, name:u.name, role:u.role } });
 });
 
-// Auth (admin)
-app.post('/api/admin/login', async (req, res) => {
-  const { email, password } = req.body || {};
-  const u = await User.findOne({ email: (email||'').toLowerCase(), role: 'admin' });
-  if (!u) return res.status(400).json({ error: 'Invalid credentials' });
-  const ok = await bcrypt.compare(password || '', u.passwordHash);
-  if (!ok) return res.status(400).json({ error: 'Invalid credentials' });
-  return res.json({ token: makeToken(u), user: { id: u.id, name: u.name, role: u.role } });
+// Auth: client register (Turnstile + FormData)
+app.post('/api/auth/register', upload.none(), requireTurnstile, async (req,res)=>{
+  const { name='', email='', password='' } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error:'Email and password required' });
+  const lower = email.toLowerCase();
+  const exists = await User.findOne({ email: lower });
+  if (exists) return res.status(400).json({ error:'Email already in use' });
+  const u = await User.create({ email: lower, name, role:'client', passwordHash: await bcrypt.hash(password,10) });
+  return res.json({ token: makeToken(u), user:{ id:u.id, name:u.name, role:u.role } });
+});
+
+// Auth: whoami (for guards)
+app.get('/api/auth/me', authRequired(), async (req,res)=>{
+  const u = await User.findById(req.user.sub).select('email name role createdAt');
+  if (!u) return res.status(404).json({ error:'Not found' });
+  res.json({ user: { email:u.email, name:u.name, role:u.role, createdAt:u.createdAt } });
 });
 
 // Password reset (request)
-app.post('/api/auth/request-reset', async (req, res) => {
+app.post('/api/auth/request-reset', async (req,res)=>{
   const { email } = req.body || {};
-  if (!email) return res.status(400).json({ error: 'Email required' });
-  const token = randomUUID().replace(/-/g, '');
-  const expires = new Date(Date.now() + 30 * 60 * 1000);
+  if (!email) return res.status(400).json({ error:'Email required' });
+  const token = randomUUID().replace(/-/g,'');
+  const expires = new Date(Date.now() + 30*60*1000);
   await ResetToken.create({ email: email.toLowerCase(), token, expiresAt: expires });
-  // TODO: send email with token link
-  return res.status(204).end();
+  // TODO: email the token
+  res.status(204).end();
 });
 
 // Password reset (confirm)
-app.post('/api/auth/reset', async (req, res) => {
+app.post('/api/auth/reset', async (req,res)=>{
   const { token, newPassword } = req.body || {};
-  if (!token || !newPassword) return res.status(400).json({ error: 'Token and newPassword required' });
-  const rt = await ResetToken.findOne({ token, used: false, expiresAt: { $gt: new Date() } });
-  if (!rt) return res.status(400).json({ error: 'Invalid or expired token' });
+  if (!token || !newPassword) return res.status(400).json({ error:'Token and newPassword required' });
+  const rt = await ResetToken.findOne({ token, used:false, expiresAt:{ $gt:new Date() } });
+  if (!rt) return res.status(400).json({ error:'Invalid or expired token' });
   const u = await User.findOne({ email: rt.email });
-  if (!u) return res.status(400).json({ error: 'No account for token' });
-  u.passwordHash = await bcrypt.hash(newPassword, 10);
-  await u.save();
+  if (!u) return res.status(400).json({ error:'No account for token' });
+  u.passwordHash = await bcrypt.hash(newPassword,10); await u.save();
   rt.used = true; await rt.save();
-  return res.status(204).end();
+  res.status(204).end();
 });
 
-// KYC / Account open (multipart + Turnstile + GridFS)
+// Onboarding submit (multipart + Turnstile + GridFS)
 app.post('/api/onboarding/submit',
   upload.fields([
-    { name: 'passport', maxCount: 1 },
-    { name: 'proofOfAddress', maxCount: 1 },
-    { name: 'companyDocs', maxCount: 20 },
-    { name: 'selfie', maxCount: 1 }
+    { name:'passport', maxCount:1 },
+    { name:'proofOfAddress', maxCount:1 },
+    { name:'companyDocs', maxCount:20 },
+    { name:'selfie', maxCount:1 }
   ]),
-  requireTurnstile,
-  async (req, res) => {
+  async (req,res,next)=>{ // Turnstile token comes via FormData from frontend
+    req.body['cf_turnstile_response'] = req.body['cf_turnstile_response'] || req.headers['x-turnstile'] || '';
+    next();
+  },
+  async (req,res,next)=>{ // verify
+    const ok = await verifyTurnstile(req.body['cf_turnstile_response'], req.ip);
+    if (!ok) return res.status(400).json({ error:'Captcha verification failed' });
+    next();
+  },
+  async (req,res) => {
     const gfs = getGridFSBucket();
-
-    async function save(field) {
+    async function save(field){
       const files = req.files?.[field] || [];
       const out = [];
       for (const f of files) {
         const filename = `${Date.now()}_${f.originalname}`;
         const us = gfs.openUploadStream(filename, { contentType: f.mimetype });
         us.end(f.buffer);
-        const fin = await new Promise((resolve, reject) => {
-          us.on('finish', resolve);
-          us.on('error', reject);
-        });
+        const fin = await new Promise((resolve,reject)=>{ us.on('finish',resolve); us.on('error',reject); });
         out.push({ gridfsId: fin._id, filename, mime: f.mimetype, size: f.size });
       }
       return out;
     }
-
     const [passport, proofOfAddress, companyDocs, selfie] = await Promise.all([
       save('passport'), save('proofOfAddress'), save('companyDocs'), save('selfie')
     ]);
-
     const { fullName, email, phone, companyName, country } = req.body;
     const applicationId = randomUUID();
-
     const doc = await Application.create({
-      applicationId,
-      status: 'received',
-      fields: { fullName, email, phone, companyName, country },
-      files: { passport, proofOfAddress, companyDocs, selfie },
+      applicationId, status:'received',
+      fields:{ fullName, email, phone, companyName, country },
+      files:{ passport, proofOfAddress, companyDocs, selfie },
       submittedByIp: req.ip
     });
-
     res.json({ applicationId: doc.applicationId, status: doc.status, receivedAt: doc.createdAt });
   }
 );
 
-// Contact (Turnstile; stores to DB)
-app.post('/api/contact', requireTurnstile, async (req, res) => {
+// Contact (FormData + Turnstile) — FIXED to parse multipart
+app.post('/api/contact', upload.none(), requireTurnstile, async (req,res)=>{
   const { name='', email='', phone='', subject='', message='' } = req.body || {};
-  await ContactMessage.create({
-    name, email, phone, subject, message,
-    meta: { userAgent: req.headers['user-agent'] || '', ip: req.ip }
-  });
+  await ContactMessage.create({ name, email, phone, subject, message, meta:{ userAgent:req.headers['user-agent']||'', ip:req.ip } });
   res.status(204).end();
 });
 
-// Admin: list applications (existing)
-app.get('/api/admin/applications', authRequired('admin'), async (_req, res) => {
-  const items = await Application.find().sort({ createdAt: -1 }).limit(100);
+// Admin: list
+app.get('/api/admin/applications', authRequired('admin'), async (_req,res)=>{
+  const items = await Application.find().sort({ createdAt:-1 }).limit(100);
   res.json({ items });
 });
 
-// Admin: application detail (NEW)
-app.get('/api/admin/applications/:id', authRequired('admin'), async (req, res) => {
+// Admin: detail
+app.get('/api/admin/applications/:id', authRequired('admin'), async (req,res)=>{
   const item = await Application.findOne({ applicationId: req.params.id });
-  if (!item) return res.status(404).json({ error: 'Not found' });
+  if (!item) return res.status(404).json({ error:'Not found' });
   res.json({ item });
 });
 
-// Admin: download a file from GridFS (NEW)
-app.get('/api/admin/applications/:id/files/:field/:gridId', authRequired('admin'), async (req, res) => {
+// Admin: download a file from GridFS
+app.get('/api/admin/applications/:id/files/:field/:gridId', authRequired('admin'), async (req,res)=>{
   const { id, field, gridId } = req.params;
-
   const appDoc = await Application.findOne({ applicationId: id });
-  if (!appDoc) return res.status(404).json({ error: 'Application not found' });
-
+  if (!appDoc) return res.status(404).json({ error:'Application not found' });
   const arr = (appDoc.files && appDoc.files[field]) || [];
   const meta = arr.find(f => String(f.gridfsId) === gridId);
-  if (!meta) return res.status(404).json({ error: 'File not found' });
-
-  const oid = tryObjectId(gridId);
-  if (!oid) return res.status(400).json({ error: 'Bad file id' });
-
-  try {
-    res.setHeader('Content-Type', meta.mime || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `attachment; filename="${meta.filename || 'file'}"`);
-    getGridFSBucket()
-      .openDownloadStream(oid)
-      .on('error', () => res.status(500).end())
-      .pipe(res);
-  } catch {
-    return res.status(500).end();
-  }
+  if (!meta) return res.status(404).json({ error:'File not found' });
+  const oid = tryObjectId(gridId); if (!oid) return res.status(400).json({ error:'Bad file id' });
+  res.setHeader('Content-Type', meta.mime || 'application/octet-stream');
+  res.setHeader('Content-Disposition', `attachment; filename="${meta.filename || 'file'}"`);
+  getGridFSBucket().openDownloadStream(oid).on('error',()=>res.status(500).end()).pipe(res);
 });
 
-// One-time seed: create demo admin/client
-app.post('/api/dev/seed-admin', async (req, res) => {
-  const key = req.headers['x-seed-key'];
-  if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error: 'Forbidden' });
+// Client overview (stub for dashboard hydrate)
+app.get('/api/client/overview', authRequired('client'), async (_req,res)=> res.json({ accounts: [] }));
 
-  async function ensure(email, password, role, name) {
-    let u = await User.findOne({ email });
-    if (!u) u = await User.create({ email, passwordHash: await bcrypt.hash(password, 10), role, name });
+// Seed (dev)
+app.post('/api/dev/seed-admin', async (req,res)=>{
+  const key = req.headers['x-seed-key'];
+  if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error:'Forbidden' });
+  async function ensure(email, password, role, name){
+    let u = await User.findOne({ email }); if (!u) u = await User.create({ email, passwordHash: await bcrypt.hash(password,10), role, name });
     return u;
   }
-  const client = await ensure('client@example.com', 'client123', 'client', 'Demo Client');
-  const admin  = await ensure('admin@example.com',  'admin123',  'admin',  'Demo Admin');
-  res.json({ ok: true, client: client.email, admin: admin.email });
+  const client = await ensure('client@example.com','client123','client','Demo Client');
+  const admin  = await ensure('admin@example.com', 'admin123', 'admin','Demo Admin');
+  res.json({ ok:true, client:client.email, admin:admin.email });
 });
 
-// ---------- Boot ----------
-(async () => {
+// ---- Boot ----
+(async ()=>{
   try {
     await connectMongo(MONGODB_URI);
-    app.listen(PORT, () => console.log(`API listening on :${PORT}`));
-    const stop = async () => { await shutdown(); process.exit(0); };
-    process.on('SIGINT', stop);
-    process.on('SIGTERM', stop);
-  } catch (e) {
-    console.error('Boot error:', e);
-    process.exit(1);
-  }
+    app.listen(PORT, ()=>console.log(`API :${PORT}`));
+    const stop = async ()=>{ await shutdown(); process.exit(0); };
+    process.on('SIGINT', stop); process.on('SIGTERM', stop);
+  } catch(e){ console.error('Boot error:', e); process.exit(1); }
 })();
