@@ -1,6 +1,7 @@
-// server.js — Maltese First Capital API (v1.9.3)
-// Adds: alias /api/onboarding/account-open, CORS preflight, dual Turnstile field support.
-// Keeps: auth, Turnstile, onboarding, contact, admin apps, GridFS, accounts, email notify.
+// server.js — Maltese First Capital API (v1.9.4)
+// Adds: alias /api/onboarding/account-open, CORS preflight, dual Turnstile field support,
+//        one-time /api/admin/bootstrap route (guarded by DEV_SEED_KEY).
+// Keeps: auth, onboarding, contact, admin apps, GridFS, accounts, CSP, rate limits, ClamAV, SHA-256.
 
 require('dotenv').config();
 const express = require('express');
@@ -52,7 +53,7 @@ async function sendNotify(subject, html) {
 const app = express();
 app.set('trust proxy', 1);
 
-// CORS
+// CORS (allow exact origins only) + preflight
 const ALLOWED = CORS_ORIGIN.split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
   origin: (origin, cb) => (!origin || ALLOWED.includes(origin)) ? cb(null, true) : cb(new Error('Not allowed by CORS')),
@@ -60,7 +61,6 @@ app.use(cors({
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
   allowedHeaders: ['Content-Type','Authorization','X-Requested-With']
 }));
-// Preflight for all routes (important for multipart + custom headers)
 app.options('*', cors());
 
 // Helmet + CSP (allow Turnstile)
@@ -178,11 +178,9 @@ async function clamScan(buffer){
     const s = net.createConnection(CLAMAV_PORT, CLAMAV_HOST, () => {
       s.write("zINSTREAM\0");
       s.write(Buffer.alloc(4)); // empty chunk to init
-      // chunk
       const len = Buffer.alloc(4); len.writeUInt32BE(buffer.length, 0);
       s.write(len); s.write(buffer);
-      // terminator
-      s.write(Buffer.alloc(4)); // 0 length terminator
+      s.write(Buffer.alloc(4)); // 0 terminator
     });
     s.setTimeout(10000);
     s.on('data', (d) => {
@@ -200,7 +198,7 @@ async function clamScan(buffer){
 const upload = multer({ storage: multer.memoryStorage(), limits:{ fileSize: 16*1024*1024 } });
 
 // ---- Routes ----
-app.get('/api/health', (_req,res)=> res.json({ ok:true, env:NODE_ENV, version:'1.9.3', uptime:process.uptime() }));
+app.get('/api/health', (_req,res)=> res.json({ ok:true, env:NODE_ENV, version:'1.9.4', uptime:process.uptime() }));
 
 // Auth
 app.post('/api/auth/login', async (req,res)=>{
@@ -239,10 +237,36 @@ app.post('/api/auth/reset', async (req,res)=>{
   u.passwordHash = await bcrypt.hash(newPassword,10); await u.save(); rt.used=true; await rt.save(); res.status(204).end();
 });
 
-// Onboarding (KYC)
-const ALLOWED_MIME = new Set(["application/pdf","image/jpeg","image/png","image/webp"]);
+// ---- Admin bootstrap (guarded by DEV_SEED_KEY) ----
+app.post('/api/admin/bootstrap', async (req, res) => {
+  try {
+    const key = req.headers['x-seed-key'];
+    if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    const { email, password, name = 'Administrator' } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: 'email and password required' });
 
-// shared handler + upload fields so we can mount two routes
+    const exists = await mongoose.model('User').findOne({ email: email.toLowerCase(), role: 'admin' });
+    if (exists) return res.status(409).json({ error: 'Admin already exists' });
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    await mongoose.model('User').create({
+      email: email.toLowerCase(),
+      name,
+      role: 'admin',
+      passwordHash
+    });
+
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('bootstrap-admin error', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ---- Onboarding (KYC) ----
+const ALLOWED_MIME = new Set(["application/pdf","image/jpeg","image/png","image/webp"]);
 const kycUpload = upload.fields([
   {name:'passport',maxCount:1},
   {name:'proofOfAddress',maxCount:1},
@@ -252,7 +276,6 @@ const kycUpload = upload.fields([
 
 async function onboardingHandler(req,res){
   try{
-    // Turnstile check (accept underscore OR hyphen names)
     const tsToken = req.body?.['cf_turnstile_response'] || req.body?.['cf-turnstile-response'] || '';
     const ok = await verifyTurnstile(tsToken, req.ip);
     if(!ok) return res.status(400).json({error:'Captcha verification failed'});
@@ -289,7 +312,6 @@ async function onboardingHandler(req,res){
       submittedByIp:req.ip
     });
 
-    // Notify ops (optional)
     sendNotify('New Account Application', `
       <h3>New Application Received</h3>
       <p><b>ID:</b> ${doc.applicationId}</p>
@@ -305,11 +327,11 @@ async function onboardingHandler(req,res){
   }
 }
 
-// Mount both routes (alias)
+// Mount both routes (alias kept for the frontend wiring)
 app.post('/api/onboarding/submit', kycUpload, onboardingHandler);
 app.post('/api/onboarding/account-open', kycUpload, onboardingHandler);
 
-// Contact
+// ---- Contact ----
 app.post('/api/contact', upload.none(), async (req,res)=>{
   const tsToken = req.body?.['cf_turnstile_response'] || req.body?.['cf-turnstile-response'] || '';
   const ok = await verifyTurnstile(tsToken, req.ip);
@@ -325,7 +347,7 @@ app.post('/api/contact', upload.none(), async (req,res)=>{
   res.status(204).end();
 });
 
-// Admin: list, detail, file download
+// ---- Admin: list, detail, file download ----
 app.get('/api/admin/applications', authRequired('admin'), async (_req,res)=>{
   const items = await Application.find().sort({ createdAt:-1 }).limit(100);
   res.json({ items });
@@ -345,13 +367,13 @@ app.get('/api/admin/applications/:id/files/:field/:gridId', authRequired('admin'
   getGridFSBucket().openDownloadStream(oid).on('error',()=>res.status(500).end()).pipe(res);
 });
 
-// Client overview → real accounts
+// ---- Client overview → real accounts ----
 app.get('/api/client/overview', authRequired('client'), async (req,res)=>{
   const accounts = await Account.find({ owner: req.user.sub }).select('-__v');
   res.json({ accounts });
 });
 
-// Dev seed account (unchanged)
+// ---- Dev seed account (unchanged) ----
 app.post('/api/admin/dev-seed-account', async (req,res)=>{
   const key=req.headers['x-seed-key']; if(!DEV_SEED_KEY || key!==DEV_SEED_KEY) return res.status(403).json({error:'Forbidden'});
   const { email, amount=5000000, currency='USD', ts, status='not_activated' } = req.body || {};
@@ -378,7 +400,7 @@ app.post('/api/admin/dev-seed-account', async (req,res)=>{
   res.json({ ok:true, accountNo: acct.accountNo, user: user.email, status: acct.status });
 });
 
-// Friendly multer errors
+// ---- Friendly multer errors ----
 app.use((err, _req, res, next) => {
   if (err && err.code === 'LIMIT_FILE_SIZE') {
     return res.status(413).json({ error: 'File too large (max 16MB each)' });
