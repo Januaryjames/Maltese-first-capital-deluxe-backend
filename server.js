@@ -156,16 +156,21 @@ function authRequired(role){
   };
 }
 async function verifyTurnstile(token, ip){
-  if (BYPASS_CAPTCHA === '1') return true;            // ← TEMP BYPASS SUPPORT
-  if(!TURNSTILE_SECRET) return false;
+  // Allow simple demos:
+  if (process.env.BYPASS_CAPTCHA === '1') return true;
+  if (!TURNSTILE_SECRET) return true; // if no secret configured, do not block
+
   try{
     const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-      method:'POST', headers:{'content-type':'application/x-www-form-urlencoded'},
+      method:'POST',
+      headers:{'content-type':'application/x-www-form-urlencoded'},
       body:`secret=${encodeURIComponent(TURNSTILE_SECRET)}&response=${encodeURIComponent(token||'')}&remoteip=${encodeURIComponent(ip||'')}`
     });
-    const d = await r.json(); return !!d.success;
-  }catch{ return false; }
-}
+    const d = await r.json(); 
+    return !!d.success;
+  }catch{
+    return false;
+  }
 function tryObjectId(str){ try { return new mongoose.Types.ObjectId(str); } catch { return null; } }
 function genAccountNo(){ return String(Math.floor(10_000_000 + Math.random()*90_000_000)); }
 
