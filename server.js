@@ -63,20 +63,10 @@ app.use(cors({
 }));
 app.options('*', cors());
 
-// Helmet + CSP (allow Turnstile)
+// Helmet without CSP
 app.use(helmet({
-  crossOriginResourcePolicy: { policy: 'cross-origin' },
-  contentSecurityPolicy: {
-    useDefaults: true,
-    directives: {
-      "default-src": ["'self'"],
-      "script-src": ["'self'", "https://challenges.cloudflare.com"],
-      "frame-src": ["'self'", "https://challenges.cloudflare.com"],
-      "img-src": ["'self'", "data:"],
-      "style-src": ["'self'", "'unsafe-inline'"],
-      "connect-src": ["'self'", "https:"] // allows API calls over HTTPS
-    }
-  }
+  contentSecurityPolicy: false,                   // <— turn CSP off
+  crossOriginResourcePolicy: { policy: 'cross-origin' }
 }));
 
 app.use(express.json({ limit: '2mb' }));
