@@ -1,7 +1,6 @@
-// server.js — Maltese First Capital API (v1.9.4)
-// Adds: alias /api/onboarding/account-open, CORS preflight, dual Turnstile field support,
-//        one-time /api/admin/bootstrap route (guarded by DEV_SEED_KEY).
-// Keeps: auth, onboarding, contact, admin apps, GridFS, accounts, CSP, rate limits, ClamAV, SHA-256.
+// server.js — Maltese First Capital API (v1.9.5)
+// CSP off; CORS + preflight; Turnstile bypass toggle; dual field/file support;
+// alias /api/onboarding/account-open; admin bootstrap; GridFS; rate limit; ClamAV.
 
 require('dotenv').config();
 const express = require('express');
@@ -24,6 +23,7 @@ const {
   JWT_SECRET = 'change_me',
   CORS_ORIGIN = 'https://maltesefirst.com,https://www.maltesefirst.com',
   TURNSTILE_SECRET,
+  BYPASS_CAPTCHA = '0',
   DEV_SEED_KEY,
   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS,
   NOTIFY_FROM = 'Maltese First <no-reply@maltesefirst.com>',
@@ -33,7 +33,7 @@ const {
 
 if (!MONGODB_URI) throw new Error('MONGODB_URI missing');
 
-// ---- Mailer (optional) ----
+// ───────────────────────── Mailer (optional)
 let mailer = null;
 if (SMTP_HOST && SMTP_PORT && SMTP_USER && SMTP_PASS) {
   mailer = nodemailer.createTransport({
@@ -49,11 +49,11 @@ async function sendNotify(subject, html) {
   catch (e) { console.warn('notify mail failed:', e.message); }
 }
 
-// ---- App ----
+// ───────────────────────── App
 const app = express();
 app.set('trust proxy', 1);
 
-// CORS (allow exact origins only) + preflight
+// CORS (exact origins only) + preflight
 const ALLOWED = CORS_ORIGIN.split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
   origin: (origin, cb) => (!origin || ALLOWED.includes(origin)) ? cb(null, true) : cb(new Error('Not allowed by CORS')),
@@ -63,9 +63,9 @@ app.use(cors({
 }));
 app.options('*', cors());
 
-// Helmet without CSP
+// Helmet — CSP disabled per current rollout
 app.use(helmet({
-  contentSecurityPolicy: false,                   // <— turn CSP off
+  contentSecurityPolicy: false,
   crossOriginResourcePolicy: { policy: 'cross-origin' }
 }));
 
@@ -73,7 +73,7 @@ app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 app.use('/api/', rateLimit({ windowMs: 10*60*1000, max: 100, standardHeaders: true, legacyHeaders: false }));
 
-// ---- Mongo + GridFS ----
+// ───────────────────────── Mongo + GridFS
 let gfsBucket = null, nativeClient = null;
 async function connectMongo(uri) {
   await mongoose.connect(uri, { maxPoolSize: 20 });
@@ -85,7 +85,7 @@ async function connectMongo(uri) {
 function getGridFSBucket(){ if (!gfsBucket) throw new Error('GridFS not ready'); return gfsBucket; }
 async function shutdown(){ await mongoose.disconnect().catch(()=>{}); if (nativeClient) await nativeClient.close().catch(()=>{}); }
 
-// ---- Schemas ----
+// ───────────────────────── Schemas
 const User = mongoose.model('User', new mongoose.Schema({
   email: { type:String, unique:true, index:true, required:true, lowercase:true, trim:true },
   passwordHash: { type:String, required:true },
@@ -103,7 +103,14 @@ const FileMetaSchema = new mongoose.Schema({
 const Application = mongoose.model('Application', new mongoose.Schema({
   applicationId:{ type:String, unique:true, index:true },
   status:{ type:String, enum:['received','review','approved','rejected'], default:'received' },
-  fields:{ fullName:String, email:String, phone:String, companyName:String, country:String },
+  fields:{
+    fullName:String, email:String, phone:String,
+    companyName:String, country:String,
+    address:String, currency:String,
+    accountType:String, commercialRegistration:String,
+    sourceOfFunds:String, notes:String,
+    extra: mongoose.Schema.Types.Mixed // full raw body snapshot
+  },
   files:{ passport:[FileMetaSchema], proofOfAddress:[FileMetaSchema], companyDocs:[FileMetaSchema], selfie:[FileMetaSchema] },
   submittedByIp:String
 },{timestamps:true}));
@@ -138,7 +145,7 @@ const ContactMessage = mongoose.model('ContactMessage', new mongoose.Schema({
   meta:{ userAgent:String, ip:String }
 },{timestamps:true}));
 
-// ---- Helpers ----
+// ───────────────────────── Helpers
 function makeToken(u){ return jwt.sign({ sub:u.id, role:u.role, name:u.name }, JWT_SECRET, { expiresIn:'1h' }); }
 function authRequired(role){
   return (req,res,next)=>{
@@ -149,6 +156,7 @@ function authRequired(role){
   };
 }
 async function verifyTurnstile(token, ip){
+  if (BYPASS_CAPTCHA === '1') return true;            // ← TEMP BYPASS SUPPORT
   if(!TURNSTILE_SECRET) return false;
   try{
     const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
@@ -159,7 +167,7 @@ async function verifyTurnstile(token, ip){
   }catch{ return false; }
 }
 function tryObjectId(str){ try { return new mongoose.Types.ObjectId(str); } catch { return null; } }
-function genAccountNo(){ return String(Math.floor(10_000_000 + Math.random()*90_000_000)); } // 8 digits
+function genAccountNo(){ return String(Math.floor(10_000_000 + Math.random()*90_000_000)); }
 
 // Optional: ClamAV stream scan (skips if not configured)
 async function clamScan(buffer){
@@ -167,10 +175,10 @@ async function clamScan(buffer){
   return new Promise((resolve) => {
     const s = net.createConnection(CLAMAV_PORT, CLAMAV_HOST, () => {
       s.write("zINSTREAM\0");
-      s.write(Buffer.alloc(4)); // empty chunk to init
+      s.write(Buffer.alloc(4));
       const len = Buffer.alloc(4); len.writeUInt32BE(buffer.length, 0);
       s.write(len); s.write(buffer);
-      s.write(Buffer.alloc(4)); // 0 terminator
+      s.write(Buffer.alloc(4)); // terminator
     });
     s.setTimeout(10000);
     s.on('data', (d) => {
@@ -184,11 +192,11 @@ async function clamScan(buffer){
   });
 }
 
-// ---- Multer ----
+// Multer
 const upload = multer({ storage: multer.memoryStorage(), limits:{ fileSize: 16*1024*1024 } });
 
-// ---- Routes ----
-app.get('/api/health', (_req,res)=> res.json({ ok:true, env:NODE_ENV, version:'1.9.4', uptime:process.uptime() }));
+// ───────────────────────── Routes
+app.get('/api/health', (_req,res)=> res.json({ ok:true, env:NODE_ENV, version:'1.9.5', uptime:process.uptime() }));
 
 // Auth
 app.post('/api/auth/login', async (req,res)=>{
@@ -227,13 +235,11 @@ app.post('/api/auth/reset', async (req,res)=>{
   u.passwordHash = await bcrypt.hash(newPassword,10); await u.save(); rt.used=true; await rt.save(); res.status(204).end();
 });
 
-// ---- Admin bootstrap (guarded by DEV_SEED_KEY) ----
+// Admin bootstrap (guarded by DEV_SEED_KEY)
 app.post('/api/admin/bootstrap', async (req, res) => {
   try {
     const key = req.headers['x-seed-key'];
-    if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
+    if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error: 'Forbidden' });
     const { email, password, name = 'Administrator' } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'email and password required' });
 
@@ -241,13 +247,7 @@ app.post('/api/admin/bootstrap', async (req, res) => {
     if (exists) return res.status(409).json({ error: 'Admin already exists' });
 
     const passwordHash = await bcrypt.hash(password, 10);
-    await mongoose.model('User').create({
-      email: email.toLowerCase(),
-      name,
-      role: 'admin',
-      passwordHash
-    });
-
+    await mongoose.model('User').create({ email: email.toLowerCase(), name, role: 'admin', passwordHash });
     res.json({ ok: true });
   } catch (e) {
     console.error('bootstrap-admin error', e);
@@ -255,59 +255,106 @@ app.post('/api/admin/bootstrap', async (req, res) => {
   }
 });
 
-// ---- Onboarding (KYC) ----
+// ───────────────────────── Onboarding (KYC)
 const ALLOWED_MIME = new Set(["application/pdf","image/jpeg","image/png","image/webp"]);
+
+// Accept both old and new file field names
 const kycUpload = upload.fields([
-  {name:'passport',maxCount:1},
-  {name:'proofOfAddress',maxCount:1},
-  {name:'companyDocs',maxCount:20},
-  {name:'selfie',maxCount:1}
+  { name:'passport', maxCount:1 },           // old
+  { name:'proofOfAddress', maxCount:1 },     // old
+  { name:'companyDocs', maxCount:20 },       // old
+  { name:'selfie', maxCount:1 },             // old
+  { name:'docs_id', maxCount:2 },            // new -> passport
+  { name:'docs_poa', maxCount:5 },           // new -> proofOfAddress
+  { name:'docs_corporate', maxCount:20 },    // new -> companyDocs
+  { name:'docs_sof', maxCount:20 },          // new -> append into companyDocs
+  { name:'selfie_file', maxCount:1 }         // new -> selfie
 ]);
+
+function collectFiles(req, names) {
+  const out = [];
+  for (const n of names) {
+    const arr = req.files?.[n] || [];
+    out.push(...arr);
+  }
+  return out;
+}
 
 async function onboardingHandler(req,res){
   try{
+    // Turnstile (two possible field names)
     const tsToken = req.body?.['cf_turnstile_response'] || req.body?.['cf-turnstile-response'] || '';
     const ok = await verifyTurnstile(tsToken, req.ip);
     if(!ok) return res.status(400).json({error:'Captcha verification failed'});
 
+    // Merge alt field names into canonical groups
+    const rawPassport = collectFiles(req, ['passport','docs_id']);
+    const rawPOA     = collectFiles(req, ['proofOfAddress','docs_poa']);
+    const rawCorp    = collectFiles(req, ['companyDocs','docs_corporate','docs_sof']);
+    const rawSelfie  = collectFiles(req, ['selfie','selfie_file']);
+
     const gfs = getGridFSBucket();
 
-    async function save(field){
-      const arr=req.files?.[field]||[]; const out=[];
-      for(const f of arr){
+    async function ingest(list){
+      const out = [];
+      for (const f of list) {
         if (!ALLOWED_MIME.has(f.mimetype)) {
-          return res.status(415).json({ error: `Unsupported file type: ${f.mimetype}` });
+          return { error:`Unsupported file type: ${f.mimetype}` };
         }
         const sha256 = createHash('sha256').update(f.buffer).digest('hex');
-        const av = await clamScan(f.buffer); // may skip if not configured
-        const filename=`${Date.now()}_${f.originalname}`;
-        const us=gfs.openUploadStream(filename,{contentType:f.mimetype}); us.end(f.buffer);
-        const fin=await new Promise((resolve,reject)=>{ us.on('finish',resolve); us.on('error',reject); });
+        const av = await clamScan(f.buffer); // may skip
+        const filename = `${Date.now()}_${f.originalname}`;
+        const us = gfs.openUploadStream(filename,{contentType:f.mimetype}); us.end(f.buffer);
+        const fin = await new Promise((resolve,reject)=>{ us.on('finish',resolve); us.on('error',reject); });
         out.push({ gridfsId:fin._id, filename, mime:f.mimetype, size:f.size, sha256, av });
       }
-      return out;
+      return { out };
     }
 
-    const [passport,proofOfAddress,companyDocs,selfie]=await Promise.all([
-      save('passport'), save('proofOfAddress'), save('companyDocs'), save('selfie')
-    ]);
+    const p1 = await ingest(rawPassport); if (p1.error) return res.status(415).json({ error:p1.error });
+    const p2 = await ingest(rawPOA);     if (p2.error) return res.status(415).json({ error:p2.error });
+    const p3 = await ingest(rawCorp);    if (p3.error) return res.status(415).json({ error:p3.error });
+    const p4 = await ingest(rawSelfie);  if (p4.error) return res.status(415).json({ error:p4.error });
 
-    const { fullName,email,phone,companyName,country }=req.body||{};
+    // Map both naming styles to canonical fields
+    const b = req.body || {};
+    const fullName     = b.fullName || b.authorized_person || b.authorised_person || '';
+    const companyName  = b.companyName || b.company_name || '';
+    const address      = b.address || b.company_address || '';
+    const currency     = b.currency || '';
+    const accountType  = b.accountType || b.account_type || '';
+    const commercialRegistration = b.commercialRegistration || b.commercial_registration || '';
+    const sourceOfFunds = b.sourceOfFunds || b.source_of_funds || '';
+    const notes        = b.notes || '';
+
     const applicationId = randomUUID();
 
     const doc = await Application.create({
       applicationId, status:'received',
-      fields:{fullName,email,phone,companyName,country},
-      files:{passport,proofOfAddress,companyDocs,selfie},
-      submittedByIp:req.ip
+      fields:{
+        fullName,
+        email: b.email || '',
+        phone: b.phone || '',
+        companyName,
+        country: b.country || '',
+        address, currency, accountType, commercialRegistration, sourceOfFunds, notes,
+        extra: b
+      },
+      files:{
+        passport: p1.out,
+        proofOfAddress: p2.out,
+        companyDocs: p3.out,
+        selfie: p4.out
+      },
+      submittedByIp: req.ip
     });
 
     sendNotify('New Account Application', `
       <h3>New Application Received</h3>
       <p><b>ID:</b> ${doc.applicationId}</p>
       <p><b>Company:</b> ${companyName||'-'}<br/>
-         <b>Contact:</b> ${fullName||'-'} · ${email||'-'} · ${phone||'-'}<br/>
-         <b>Country:</b> ${country||'-'}</p>
+         <b>Contact:</b> ${fullName||'-'} · ${b.email||'-'} · ${b.phone||'-'}<br/>
+         <b>Country:</b> ${b.country||'-'}</p>
     `).catch(()=>{});
 
     return res.status(202).json({ applicationId:doc.applicationId, status:doc.status, receivedAt:doc.createdAt });
@@ -321,7 +368,7 @@ async function onboardingHandler(req,res){
 app.post('/api/onboarding/submit', kycUpload, onboardingHandler);
 app.post('/api/onboarding/account-open', kycUpload, onboardingHandler);
 
-// ---- Contact ----
+// Contact
 app.post('/api/contact', upload.none(), async (req,res)=>{
   const tsToken = req.body?.['cf_turnstile_response'] || req.body?.['cf-turnstile-response'] || '';
   const ok = await verifyTurnstile(tsToken, req.ip);
@@ -337,7 +384,7 @@ app.post('/api/contact', upload.none(), async (req,res)=>{
   res.status(204).end();
 });
 
-// ---- Admin: list, detail, file download ----
+// Admin: list, detail, file download
 app.get('/api/admin/applications', authRequired('admin'), async (_req,res)=>{
   const items = await Application.find().sort({ createdAt:-1 }).limit(100);
   res.json({ items });
@@ -357,13 +404,13 @@ app.get('/api/admin/applications/:id/files/:field/:gridId', authRequired('admin'
   getGridFSBucket().openDownloadStream(oid).on('error',()=>res.status(500).end()).pipe(res);
 });
 
-// ---- Client overview → real accounts ----
+// Client overview → real accounts
 app.get('/api/client/overview', authRequired('client'), async (req,res)=>{
   const accounts = await Account.find({ owner: req.user.sub }).select('-__v');
   res.json({ accounts });
 });
 
-// ---- Dev seed account (unchanged) ----
+// Dev seed account (unchanged)
 app.post('/api/admin/dev-seed-account', async (req,res)=>{
   const key=req.headers['x-seed-key']; if(!DEV_SEED_KEY || key!==DEV_SEED_KEY) return res.status(403).json({error:'Forbidden'});
   const { email, amount=5000000, currency='USD', ts, status='not_activated' } = req.body || {};
@@ -390,7 +437,7 @@ app.post('/api/admin/dev-seed-account', async (req,res)=>{
   res.json({ ok:true, accountNo: acct.accountNo, user: user.email, status: acct.status });
 });
 
-// ---- Friendly multer errors ----
+// Friendly multer errors
 app.use((err, _req, res, next) => {
   if (err && err.code === 'LIMIT_FILE_SIZE') {
     return res.status(413).json({ error: 'File too large (max 16MB each)' });
@@ -398,7 +445,7 @@ app.use((err, _req, res, next) => {
   next(err);
 });
 
-// ---- Boot ----
+// Boot
 (async()=>{
   try {
     await connectMongo(MONGODB_URI);
