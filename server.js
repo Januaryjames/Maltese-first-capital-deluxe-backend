@@ -1,4 +1,4 @@
-// server.js — Maltese First Capital API (v1.9.5)
+// server.js — Maltese First Capital API (v1.9.6)
 // CSP off; CORS + preflight; Turnstile bypass toggle; dual field/file support;
 // alias /api/onboarding/account-open; admin bootstrap; GridFS; rate limit; ClamAV.
 
@@ -109,7 +109,7 @@ const Application = mongoose.model('Application', new mongoose.Schema({
     address:String, currency:String,
     accountType:String, commercialRegistration:String,
     sourceOfFunds:String, notes:String,
-    extra: mongoose.Schema.Types.Mixed // full raw body snapshot
+    extra: mongoose.Schema.Types.Mixed
   },
   files:{ passport:[FileMetaSchema], proofOfAddress:[FileMetaSchema], companyDocs:[FileMetaSchema], selfie:[FileMetaSchema] },
   submittedByIp:String
@@ -155,22 +155,23 @@ function authRequired(role){
     catch{ return res.status(401).json({error:'Invalid token'}); }
   };
 }
-async function verifyTurnstile(token, ip){
-  // Allow simple demos:
-  if (process.env.BYPASS_CAPTCHA === '1') return true;
-  if (!TURNSTILE_SECRET) return true; // if no secret configured, do not block
 
+async function verifyTurnstile(token, ip){
+  if (BYPASS_CAPTCHA === '1') return true;
+  if (!TURNSTILE_SECRET) return true; // permissive if not configured
   try{
     const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
       method:'POST',
       headers:{'content-type':'application/x-www-form-urlencoded'},
       body:`secret=${encodeURIComponent(TURNSTILE_SECRET)}&response=${encodeURIComponent(token||'')}&remoteip=${encodeURIComponent(ip||'')}`
     });
-    const d = await r.json(); 
+    const d = await r.json();
     return !!d.success;
-  }catch{
+  } catch {
     return false;
   }
+} // ✅ <-- this closing brace was missing in your v1.9.5
+
 function tryObjectId(str){ try { return new mongoose.Types.ObjectId(str); } catch { return null; } }
 function genAccountNo(){ return String(Math.floor(10_000_000 + Math.random()*90_000_000)); }
 
@@ -201,7 +202,16 @@ async function clamScan(buffer){
 const upload = multer({ storage: multer.memoryStorage(), limits:{ fileSize: 16*1024*1024 } });
 
 // ───────────────────────── Routes
-app.get('/api/health', (_req,res)=> res.json({ ok:true, env:NODE_ENV, version:'1.9.5', uptime:process.uptime() }));
+app.get('/api/health', (_req,res)=> res.json({ ok:true, env:NODE_ENV, version:'1.9.6', uptime:process.uptime() }));
+
+// Public probe used by frontend to avoid 404
+app.get('/api/public/account-open', (_req, res) => {
+  res.json({
+    ok: true,
+    maxFileMB: 16,
+    allowedMime: ["application/pdf","image/jpeg","image/png","image/webp"]
+  });
+});
 
 // Auth
 app.post('/api/auth/login', async (req,res)=>{
@@ -355,7 +365,7 @@ async function onboardingHandler(req,res){
     });
 
     sendNotify('New Account Application', `
-      <h3>New Application Received</h3>
+      <h3>New Account Application</h3>
       <p><b>ID:</b> ${doc.applicationId}</p>
       <p><b>Company:</b> ${companyName||'-'}<br/>
          <b>Contact:</b> ${fullName||'-'} · ${b.email||'-'} · ${b.phone||'-'}<br/>
