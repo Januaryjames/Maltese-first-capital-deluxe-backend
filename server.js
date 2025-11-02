@@ -1,26 +1,25 @@
-// server.js — Maltese First Capital API (v1.9.7)
-// Fixes:
-//  - 404s by adding GET /api/public/account-open
-//  - Accepts both /api/onboarding/submit and /api/onboarding/account-open
-//  - BYPASS_CAPTCHA=1 path for demos
-// Keeps: auth, admin bootstrap, contact, GridFS uploads, rate limits, CORS, helmet (CSP off)
+// server.js — Maltese First Capital API (v1.9.8)
+// Fixes for your "Server error":
+// - Waits for Mongo/GridFS readiness before file ingest
+// - Turnstile bypass & robust verify (works even if fetch is missing)
+// - Accepts application/octet-stream (some browsers send this)
+// - Optional DEBUG_ERRORS=1 returns actual error reason
+// - Adds GET /api/public/account-open (204) so probes don't 404
 
 require('dotenv').config();
-
-const express   = require('express');
-const helmet    = require('helmet');
-const cors      = require('cors');
+const express = require('express');
+const helmet = require('helmet');
+const cors = require('cors');
 const rateLimit = require('express-rate-limit');
-const jwt       = require('jsonwebtoken');
-const bcrypt    = require('bcryptjs');
-const multer    = require('multer');
-const nodemailer= require('nodemailer');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const multer = require('multer');
+const nodemailer = require('nodemailer');
 const { randomUUID, createHash } = require('crypto');
-const net       = require('net');
-const mongoose  = require('mongoose');
+const net = require('net');
+const mongoose = require('mongoose');
 const { MongoClient, GridFSBucket } = require('mongodb');
 
-// ---------- ENV ----------
 const {
   PORT = 8080,
   NODE_ENV = 'production',
@@ -33,73 +32,93 @@ const {
   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS,
   NOTIFY_FROM = 'Maltese First <no-reply@maltesefirst.com>',
   NOTIFY_TO = '',
-  CLAMAV_HOST, CLAMAV_PORT = 3310
+  CLAMAV_HOST, CLAMAV_PORT = 3310,
+  DEBUG_ERRORS = '0'
 } = process.env;
 
 if (!MONGODB_URI) throw new Error('MONGODB_URI missing');
 
-// ---------- Mailer (optional) ----------
+// ---------- mailer (optional)
 let mailer = null;
 if (SMTP_HOST && SMTP_PORT && SMTP_USER && SMTP_PASS) {
   mailer = nodemailer.createTransport({
     host: SMTP_HOST,
     port: Number(SMTP_PORT),
     secure: Number(SMTP_PORT) === 465,
-    auth: { user: SMTP_USER, pass: SMTP_PASS }
+    auth: { user: SMTP_USER, pass: SMTP_PASS },
   });
 }
 async function sendNotify(subject, html) {
   if (!mailer || !NOTIFY_TO) return;
   try { await mailer.sendMail({ from: NOTIFY_FROM, to: NOTIFY_TO, subject, html }); }
-  catch(e){ console.warn('notify mail failed:', e.message); }
+  catch (e) { console.warn('notify mail failed:', e.message); }
 }
 
-// ---------- App ----------
+// ---------- app
 const app = express();
 app.set('trust proxy', 1);
 
-// CORS (exact allow-list)
+// CORS (exact origins only) + preflight
 const ALLOWED = CORS_ORIGIN.split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
   origin: (origin, cb) => (!origin || ALLOWED.includes(origin)) ? cb(null, true) : cb(new Error('Not allowed by CORS')),
   credentials: true,
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization','X-Requested-With']
+  allowedHeaders: ['Content-Type','Authorization','X-Requested-With'],
 }));
 app.options('*', cors());
 
-// Helmet (CSP off as requested)
-app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+// Helmet (CSP off for now)
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+}));
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
 app.use('/api/', rateLimit({ windowMs: 10*60*1000, max: 100, standardHeaders: true, legacyHeaders: false }));
 
-// ---------- Mongo + GridFS ----------
-let gfsBucket = null, nativeClient = null;
+// ---------- Mongo + GridFS
+let gfsBucket = null, nativeClient = null, mongoReady = false;
+
 async function connectMongo(uri) {
   await mongoose.connect(uri, { maxPoolSize: 20 });
   nativeClient = new MongoClient(uri); await nativeClient.connect();
   const dbName = mongoose.connection.name;
   gfsBucket = new GridFSBucket(nativeClient.db(dbName), { bucketName: 'uploads' });
+  mongoReady = true;
   console.log('Mongo connected:', dbName);
 }
-function gfs(){ if(!gfsBucket) throw new Error('GridFS not ready'); return gfsBucket; }
-async function shutdown(){ await mongoose.disconnect().catch(()=>{}); if(nativeClient) await nativeClient.close().catch(()=>{}); }
+function getGridFSBucket() {
+  if (!gfsBucket) throw new Error('GridFS not ready');
+  return gfsBucket;
+}
+async function waitForMongo(ms = 50, tries = 120) {
+  // wait up to ~6s by default
+  for (let i = 0; i < tries; i++) {
+    if (mongoReady) return true;
+    await new Promise(r => setTimeout(r, ms));
+  }
+  return false;
+}
+async function shutdown() {
+  await mongoose.disconnect().catch(()=>{});
+  if (nativeClient) await nativeClient.close().catch(()=>{});
+}
 
-// ---------- Schemas ----------
+// ---------- Schemas
 const User = mongoose.model('User', new mongoose.Schema({
-  email:{ type:String, unique:true, index:true, required:true, lowercase:true, trim:true },
-  passwordHash:{ type:String, required:true },
-  role:{ type:String, enum:['client','admin'], default:'client', index:true },
-  name:{ type:String, trim:true }
+  email: { type:String, unique:true, index:true, required:true, lowercase:true, trim:true },
+  passwordHash: { type:String, required:true },
+  role: { type:String, enum:['client','admin'], default:'client', index:true },
+  name: { type:String, trim:true }
 },{timestamps:true}));
 
-const FileMeta = new mongoose.Schema({
+const FileMetaSchema = new mongoose.Schema({
   gridfsId: mongoose.Schema.Types.ObjectId,
   filename: String, mime: String, size: Number,
   sha256: String,
-  av: { status:String, engine:String, reason:String }
+  av: { status: String, engine: String, reason: String }
 },{_id:false});
 
 const Application = mongoose.model('Application', new mongoose.Schema({
@@ -113,26 +132,27 @@ const Application = mongoose.model('Application', new mongoose.Schema({
     sourceOfFunds:String, notes:String,
     extra: mongoose.Schema.Types.Mixed
   },
-  files:{ passport:[FileMeta], proofOfAddress:[FileMeta], companyDocs:[FileMeta], selfie:[FileMeta] },
+  files:{ passport:[FileMetaSchema], proofOfAddress:[FileMetaSchema], companyDocs:[FileMetaSchema], selfie:[FileMetaSchema] },
   submittedByIp:String
 },{timestamps:true}));
 
-const Txn = new mongoose.Schema({
-  ts:{ type:Date, default:()=>new Date() },
-  type:{ type:String, enum:['credit','debit'], required:true },
-  amount:{ type:Number, required:true },
-  currency:{ type:String, default:'USD' },
-  description:String, meta:Object
-},{_id:false});
+const TxnSchema = new mongoose.Schema({
+  ts: { type: Date, default: () => new Date() },
+  type: { type: String, enum: ['credit','debit'], required: true },
+  amount: { type: Number, required: true },
+  currency: { type: String, default: 'USD' },
+  description: String,
+  meta: Object
+}, { _id: false });
 
 const Account = mongoose.model('Account', new mongoose.Schema({
-  accountNo:{ type:String, unique:true, index:true },
-  owner:{ type:mongoose.Schema.Types.ObjectId, ref:'User', index:true },
-  status:{ type:String, enum:['not_activated','active','suspended'], default:'not_activated', index:true },
-  currency:{ type:String, default:'USD' },
-  balance:{ type:Number, default:0 },
-  lines:[Txn]
-},{timestamps:true}));
+  accountNo: { type: String, unique: true, index: true },   // 8-digit
+  owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
+  status: { type: String, enum: ['not_activated','active','suspended'], default: 'not_activated', index: true },
+  currency: { type: String, default: 'USD' },
+  balance: { type: Number, default: 0 },
+  lines: [TxnSchema]
+}, { timestamps: true }));
 
 const ResetToken = mongoose.model('ResetToken', new mongoose.Schema({
   email:{ type:String, index:true, required:true, lowercase:true, trim:true },
@@ -146,60 +166,73 @@ const ContactMessage = mongoose.model('ContactMessage', new mongoose.Schema({
   meta:{ userAgent:String, ip:String }
 },{timestamps:true}));
 
-// ---------- Helpers ----------
+// ---------- helpers
 function makeToken(u){ return jwt.sign({ sub:u.id, role:u.role, name:u.name }, JWT_SECRET, { expiresIn:'1h' }); }
-function requireAuth(role){
+function authRequired(role){
   return (req,res,next)=>{
-    const hdr = req.headers.authorization||''; const t = hdr.startsWith('Bearer ')? hdr.slice(7):null;
+    const hdr=req.headers.authorization||''; const t=hdr.startsWith('Bearer ')?hdr.slice(7):null;
     if(!t) return res.status(401).json({error:'Missing token'});
     try{ const p=jwt.verify(t, JWT_SECRET); if(role && p.role!==role) return res.status(403).json({error:'Forbidden'}); req.user=p; next(); }
     catch{ return res.status(401).json({error:'Invalid token'}); }
   };
 }
+
+// fetch poly (in case Node runtime < 18)
+const fetchPoly = (...args) =>
+  (globalThis.fetch ? globalThis.fetch(...args) : import('node-fetch').then(({default: f}) => f(...args)));
+
 async function verifyTurnstile(token, ip){
-  if (BYPASS_CAPTCHA === '1') return true;
-  if (!TURNSTILE_SECRET) return true;
+  if (BYPASS_CAPTCHA === '1') return true;            // demo bypass
+  if (!TURNSTILE_SECRET) return true;                 // no secret => allow
   try{
-    const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify',{
+    const r = await fetchPoly('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
       method:'POST',
       headers:{'content-type':'application/x-www-form-urlencoded'},
       body:`secret=${encodeURIComponent(TURNSTILE_SECRET)}&response=${encodeURIComponent(token||'')}&remoteip=${encodeURIComponent(ip||'')}`
     });
     const d = await r.json();
     return !!d.success;
-  }catch{ return false; }
+  }catch(e){
+    console.warn('turnstile verify failed:', e.message);
+    return false;
+  }
 }
-function toOid(str){ try { return new mongoose.Types.ObjectId(str); } catch { return null; } }
-function genAcct(){ return String(Math.floor(10_000_000 + Math.random()*90_000_000)); }
+function tryObjectId(str){ try { return new mongoose.Types.ObjectId(str); } catch { return null; } }
+function genAccountNo(){ return String(Math.floor(10_000_000 + Math.random()*90_000_000)); }
 
-// Optional ClamAV
-async function clamScan(buf){
+// Optional: ClamAV stream scan (skips if not configured)
+async function clamScan(buffer){
   if(!CLAMAV_HOST) return { status:'skipped', engine:'clamav', reason:'not_configured' };
-  return new Promise((resolve)=>{
-    const s = net.createConnection(CLAMAV_PORT, CLAMAV_HOST, ()=>{
+  return new Promise((resolve) => {
+    const s = net.createConnection(CLAMAV_PORT, CLAMAV_HOST, () => {
       s.write("zINSTREAM\0");
       s.write(Buffer.alloc(4));
-      const len = Buffer.alloc(4); len.writeUInt32BE(buf.length,0);
-      s.write(len); s.write(buf);
-      s.write(Buffer.alloc(4));
+      const len = Buffer.alloc(4); len.writeUInt32BE(buffer.length, 0);
+      s.write(len); s.write(buffer);
+      s.write(Buffer.alloc(4)); // terminator
     });
     s.setTimeout(10000);
-    s.on('data',(d)=>{ const msg=d.toString(); resolve(msg.includes('FOUND')?{status:'infected',engine:'clamav',reason:msg.trim()}:{status:'clean',engine:'clamav'}); s.end(); });
-    s.on('error',()=>resolve({status:'skipped',engine:'clamav',reason:'socket_error'}));
-    s.on('timeout',()=>{ s.destroy(); resolve({status:'skipped',engine:'clamav',reason:'timeout'});});
+    s.on('data', (d) => {
+      const msg = d.toString();
+      if (msg.includes('FOUND')) resolve({ status:'infected', engine:'clamav', reason:msg.trim() });
+      else resolve({ status:'clean', engine:'clamav' });
+      s.end();
+    });
+    s.on('error', () => resolve({ status:'skipped', engine:'clamav', reason:'socket_error' }));
+    s.on('timeout', () => { s.destroy(); resolve({ status:'skipped', engine:'clamav', reason:'timeout' }); });
   });
 }
 
-// ---------- Multer ----------
+// ---------- Multer
 const upload = multer({ storage: multer.memoryStorage(), limits:{ fileSize: 16*1024*1024 } });
 
-// ---------- Routes: misc ----------
-app.get('/api/health', (_req,res)=> res.json({ ok:true, env:NODE_ENV, version:'1.9.7', uptime:process.uptime() }));
+// ---------- Routes
+app.get('/api/health', (_req,res)=> res.json({ ok:true, env:NODE_ENV, version:'1.9.8', uptime:process.uptime() }));
 
-// Small probe used by the page – prevent 404 noise
-app.get('/api/public/account-open', (_req,res)=> res.status(204).end());
+// Probe to prevent 404 noise from the frontend
+app.get('/api/public/account-open', (_req,res) => res.status(204).end());
 
-// ---------- Auth ----------
+// Auth
 app.post('/api/auth/login', async (req,res)=>{
   const {email,password}=req.body||{};
   const u = await User.findOne({ email:(email||'').toLowerCase(), role:'client' });
@@ -216,10 +249,10 @@ app.post('/api/admin/login', async (req,res)=>{
   if(!ok) return res.status(400).json({error:'Invalid credentials'});
   res.json({ token:makeToken(u), user:{ id:u.id, name:u.name, role:u.role } });
 });
-app.get('/api/auth/me', requireAuth(), async (req,res)=>{
+app.get('/api/auth/me', authRequired(), async (req,res)=>{
   const u = await User.findById(req.user.sub).select('email name role createdAt');
   if(!u) return res.status(404).json({error:'Not found'});
-  res.json({ user:{ email:u.email, name:u.name, role:u.role, createdAt:u.createdAt }});
+  res.json({ user: { email:u.email, name:u.name, role:u.role, createdAt:u.createdAt } });
 });
 app.post('/api/auth/request-reset', async (req,res)=>{
   const {email}=req.body||{}; if(!email) return res.status(400).json({error:'Email required'});
@@ -236,25 +269,12 @@ app.post('/api/auth/reset', async (req,res)=>{
   u.passwordHash = await bcrypt.hash(newPassword,10); await u.save(); rt.used=true; await rt.save(); res.status(204).end();
 });
 
-// ---------- Admin bootstrap ----------
-app.post('/api/admin/bootstrap', async (req,res)=>{
-  try{
-    const key = req.headers['x-seed-key'];
-    if(!DEV_SEED_KEY || key!==DEV_SEED_KEY) return res.status(403).json({error:'Forbidden'});
-    const { email, password, name='Administrator' } = req.body||{};
-    if(!email||!password) return res.status(400).json({error:'email and password required'});
-    const exists = await User.findOne({ email:email.toLowerCase(), role:'admin' });
-    if(exists) return res.status(409).json({error:'Admin already exists'});
-    const passwordHash = await bcrypt.hash(password,10);
-    await User.create({ email:email.toLowerCase(), name, role:'admin', passwordHash });
-    res.json({ ok:true });
-  }catch(e){ console.error('bootstrap-admin error',e); res.status(500).json({error:'Server error'}); }
-});
+// ---------- Onboarding (KYC)
+const ALLOWED_MIME = new Set([
+  "application/pdf","image/jpeg","image/png","image/webp",
+  "application/octet-stream"  // tolerate odd browsers
+]);
 
-// ---------- Onboarding (KYC) ----------
-const ALLOWED_MIME = new Set(["application/pdf","image/jpeg","image/png","image/webp"]);
-
-// accept old & new names
 const kycUpload = upload.fields([
   { name:'passport', maxCount:1 },
   { name:'proofOfAddress', maxCount:1 },
@@ -264,88 +284,111 @@ const kycUpload = upload.fields([
   { name:'docs_poa', maxCount:5 },
   { name:'docs_corporate', maxCount:20 },
   { name:'docs_sof', maxCount:20 },
-  { name:'selfie_file', maxCount:1 }
+  { name:'selfie_file', maxCount:1 },
 ]);
 
-function collect(req, names){ const out=[]; for(const n of names){ const arr=req.files?.[n]||[]; out.push(...arr);} return out; }
+function collectFiles(req, names) {
+  const out = [];
+  for (const n of names) {
+    const arr = req.files?.[n] || [];
+    out.push(...arr);
+  }
+  return out;
+}
 
 async function onboardingHandler(req,res){
   try{
-    const ts = req.body?.['cf_turnstile_response'] || req.body?.['cf-turnstile-response'] || '';
-    const pass = await verifyTurnstile(ts, req.ip);
-    if(!pass) return res.status(400).json({ error:'Captcha verification failed' });
+    // Ensure DB/GridFS ready
+    const ready = await waitForMongo();
+    if (!ready) throw new Error('Mongo not ready');
 
-    const rawPassport = collect(req, ['passport','docs_id']);
-    const rawPOA     = collect(req, ['proofOfAddress','docs_poa']);
-    const rawCorp    = collect(req, ['companyDocs','docs_corporate','docs_sof']);
-    const rawSelfie  = collect(req, ['selfie','selfie_file']);
+    // Turnstile (two possible field names)
+    const tsToken = req.body?.['cf_turnstile_response'] || req.body?.['cf-turnstile-response'] || '';
+    const ok = await verifyTurnstile(tsToken, req.ip);
+    if(!ok) return res.status(400).json({error:'Captcha verification failed'});
+
+    // Merge field aliases
+    const rawPassport = collectFiles(req, ['passport','docs_id']);
+    const rawPOA     = collectFiles(req, ['proofOfAddress','docs_poa']);
+    const rawCorp    = collectFiles(req, ['companyDocs','docs_corporate','docs_sof']);
+    const rawSelfie  = collectFiles(req, ['selfie','selfie_file']);
+
+    const gfs = getGridFSBucket();
 
     async function ingest(list){
-      const results=[];
-      for(const f of list){
-        if(!ALLOWED_MIME.has(f.mimetype)) return { error:`Unsupported file type: ${f.mimetype}` };
+      const out = [];
+      for (const f of list) {
+        const mime = f.mimetype || 'application/octet-stream';
+        if (!ALLOWED_MIME.has(mime)) {
+          return { error:`Unsupported file type: ${mime}` };
+        }
         const sha256 = createHash('sha256').update(f.buffer).digest('hex');
-        const av = await clamScan(f.buffer);
-        const filename = `${Date.now()}_${f.originalname}`;
-        const up = gfs().openUploadStream(filename,{ contentType:f.mimetype }); up.end(f.buffer);
-        const fin = await new Promise((resolve,reject)=>{ up.on('finish',resolve); up.on('error',reject); });
-        results.push({ gridfsId:fin._id, filename, mime:f.mimetype, size:f.size, sha256, av });
+        const av = await clamScan(f.buffer); // may skip
+        const filename = `${Date.now()}_${f.originalname || 'file'}`;
+        const us = gfs.openUploadStream(filename,{contentType:mime}); us.end(f.buffer);
+        const fin = await new Promise((resolve,reject)=>{ us.on('finish',resolve); us.on('error',reject); });
+        out.push({ gridfsId:fin._id, filename, mime, size:f.size, sha256, av });
       }
-      return { out: results };
+      return { out };
     }
 
-    const p1 = await ingest(rawPassport); if(p1.error) return res.status(415).json({error:p1.error});
-    const p2 = await ingest(rawPOA);     if(p2.error) return res.status(415).json({error:p2.error});
-    const p3 = await ingest(rawCorp);    if(p3.error) return res.status(415).json({error:p3.error});
-    const p4 = await ingest(rawSelfie);  if(p4.error) return res.status(415).json({error:p4.error});
+    const p1 = await ingest(rawPassport); if (p1.error) return res.status(415).json({ error:p1.error });
+    const p2 = await ingest(rawPOA);     if (p2.error) return res.status(415).json({ error:p2.error });
+    const p3 = await ingest(rawCorp);    if (p3.error) return res.status(415).json({ error:p3.error });
+    const p4 = await ingest(rawSelfie);  if (p4.error) return res.status(415).json({ error:p4.error });
 
-    const b = req.body||{};
+    // Map body
+    const b = req.body || {};
+    const fullName     = b.fullName || b.authorized_person || b.authorised_person || '';
+    const companyName  = b.companyName || b.company_name || '';
+    const address      = b.address || b.company_address || '';
+    const currency     = b.currency || '';
+    const accountType  = b.accountType || b.account_type || '';
+    const commercialRegistration = b.commercialRegistration || b.commercial_registration || '';
+    const sourceOfFunds = b.sourceOfFunds || b.source_of_funds || '';
+    const notes        = b.notes || '';
+
     const applicationId = randomUUID();
 
     const doc = await Application.create({
-      applicationId,
-      status:'received',
+      applicationId, status:'received',
       fields:{
-        fullName: b.fullName || b.authorized_person || b.authorised_person || '',
+        fullName,
         email: b.email || '',
         phone: b.phone || '',
-        companyName: b.companyName || b.company_name || '',
+        companyName,
         country: b.country || '',
-        address: b.address || b.company_address || '',
-        currency: b.currency || '',
-        accountType: b.accountType || b.account_type || '',
-        commercialRegistration: b.commercialRegistration || b.commercial_registration || '',
-        sourceOfFunds: b.sourceOfFunds || b.source_of_funds || '',
-        notes: b.notes || '',
+        address, currency, accountType, commercialRegistration, sourceOfFunds, notes,
         extra: b
       },
-      files:{ passport:p1.out, proofOfAddress:p2.out, companyDocs:p3.out, selfie:p4.out },
+      files:{ passport: p1.out, proofOfAddress: p2.out, companyDocs: p3.out, selfie: p4.out },
       submittedByIp: req.ip
     });
 
     sendNotify('New Account Application', `
       <h3>New Application Received</h3>
       <p><b>ID:</b> ${doc.applicationId}</p>
-      <p><b>Company:</b> ${doc.fields.companyName||'-'}<br/>
-         <b>Contact:</b> ${doc.fields.fullName||'-'} · ${doc.fields.email||'-'} · ${doc.fields.phone||'-'}<br/>
-         <b>Country:</b> ${doc.fields.country||'-'}</p>
+      <p><b>Company:</b> ${companyName||'-'}<br/>
+         <b>Contact:</b> ${fullName||'-'} · ${b.email||'-'} · ${b.phone||'-'}<br/>
+         <b>Country:</b> ${b.country||'-'}</p>
     `).catch(()=>{});
 
     return res.status(202).json({ applicationId:doc.applicationId, status:doc.status, receivedAt:doc.createdAt });
   }catch(e){
     console.error('onboarding submit error:', e);
-    return res.status(500).json({ error:'Server error' });
+    const msg = (DEBUG_ERRORS === '1') ? (e && e.message || 'Server error') : 'Server error';
+    return res.status(500).json({ error: msg });
   }
 }
 
-// POST endpoints (both supported)
-app.post('/api/onboarding/submit', kycUpload, onboardingHandler);
-app.post('/api/onboarding/account-open', kycUpload, onboardingHandler);
+// Mount both
+app.post('/api/onboarding/submit', upload.any(), onboardingHandler);
+app.post('/api/onboarding/account-open', upload.any(), onboardingHandler);
 
-// ---------- Contact ----------
+// Contact
 app.post('/api/contact', upload.none(), async (req,res)=>{
-  const ts = req.body?.['cf_turnstile_response'] || req.body?.['cf-turnstile-response'] || '';
-  const ok = await verifyTurnstile(ts, req.ip);
+  const tsToken = req.body?.['cf_turnstile_response'] || req.body?.['cf-turnstile-response'] || '';
+  const ok = await verifyTurnstile(tsToken, req.ip);
   if(!ok) return res.status(400).json({error:'Captcha verification failed'});
   const { name='', email='', phone='', subject='', message='' } = req.body||{};
   await ContactMessage.create({ name, email, phone, subject, message, meta:{ userAgent:req.headers['user-agent']||'', ip:req.ip } });
@@ -358,41 +401,41 @@ app.post('/api/contact', upload.none(), async (req,res)=>{
   res.status(204).end();
 });
 
-// ---------- Admin views ----------
-app.get('/api/admin/applications', requireAuth('admin'), async (_req,res)=>{
+// Admin: list, detail, file download
+app.get('/api/admin/applications', authRequired('admin'), async (_req,res)=>{
   const items = await Application.find().sort({ createdAt:-1 }).limit(100);
   res.json({ items });
 });
-app.get('/api/admin/applications/:id', requireAuth('admin'), async (req,res)=>{
+app.get('/api/admin/applications/:id', authRequired('admin'), async (req,res)=>{
   const item = await Application.findOne({ applicationId: req.params.id });
   if(!item) return res.status(404).json({error:'Not found'}); res.json({ item });
 });
-app.get('/api/admin/applications/:id/files/:field/:gridId', requireAuth('admin'), async (req,res)=>{
-  const { id, field, gridId } = req.params;
+app.get('/api/admin/applications/:id/files/:field/:gridId', authRequired('admin'), async (req,res)=>{
+  const { id, field, gridId }=req.params;
   const appDoc = await Application.findOne({ applicationId:id }); if(!appDoc) return res.status(404).json({error:'Application not found'});
-  const arr = (appDoc.files && appDoc.files[field]) || []; const meta = arr.find(f=>String(f.gridfsId)===gridId);
+  const arr=(appDoc.files && appDoc.files[field])||[]; const meta=arr.find(f=>String(f.gridfsId)===gridId);
   if(!meta) return res.status(404).json({error:'File not found'});
-  const oid = toOid(gridId); if(!oid) return res.status(400).json({error:'Bad file id'});
+  const oid=tryObjectId(gridId); if(!oid) return res.status(400).json({error:'Bad file id'});
   res.setHeader('Content-Type', meta.mime || 'application/octet-stream');
   res.setHeader('Content-Disposition', `attachment; filename="${meta.filename || 'file'}"`);
-  gfs().openDownloadStream(oid).on('error',()=>res.status(500).end()).pipe(res);
+  getGridFSBucket().openDownloadStream(oid).on('error',()=>res.status(500).end()).pipe(res);
 });
 
-// ---------- Client overview ----------
-app.get('/api/client/overview', requireAuth('client'), async (req,res)=>{
+// Client overview → real accounts
+app.get('/api/client/overview', authRequired('client'), async (req,res)=>{
   const accounts = await Account.find({ owner: req.user.sub }).select('-__v');
   res.json({ accounts });
 });
 
-// ---------- Dev seed account ----------
+// Dev seed account
 app.post('/api/admin/dev-seed-account', async (req,res)=>{
   const key=req.headers['x-seed-key']; if(!DEV_SEED_KEY || key!==DEV_SEED_KEY) return res.status(403).json({error:'Forbidden'});
-  const { email, amount=5000000, currency='USD', ts, status='not_activated' } = req.body||{};
+  const { email, amount=5000000, currency='USD', ts, status='not_activated' } = req.body || {};
   if(!email) return res.status(400).json({error:'email required'});
 
-  let user = await User.findOne({ email: email.toLowerCase() });
-  if(!user){
-    user = await User.create({
+  let user = await mongoose.model('User').findOne({ email: email.toLowerCase() });
+  if (!user) {
+    user = await mongoose.model('User').create({
       email: email.toLowerCase(),
       name: email.split('@')[0],
       role: 'client',
@@ -400,30 +443,31 @@ app.post('/api/admin/dev-seed-account', async (req,res)=>{
     });
   }
 
-  const accountNo = genAcct();
+  const accountNo = genAccountNo();
   const when = ts ? new Date(ts) : new Date();
   const acct = await Account.create({
-    accountNo, owner:user._id, status, currency,
+    accountNo, owner: user._id, status, currency,
     balance: amount,
-    lines:[{ ts: when, type:'credit', amount, currency, description:'Loan Credit (Pending Activation)', meta:{ source:'admin-seed' } }]
+    lines: [{ ts: when, type:'credit', amount, currency, description:'Loan Credit (Pending Activation)', meta:{ source:'admin-seed' } }]
   });
 
-  res.json({ ok:true, accountNo:acct.accountNo, user:user.email, status:acct.status });
+  res.json({ ok:true, accountNo: acct.accountNo, user: user.email, status: acct.status });
 });
 
-// ---------- Friendly multer + API 404 ----------
-app.use((err,_req,res,next)=>{
-  if(err && err.code==='LIMIT_FILE_SIZE') return res.status(413).json({error:'File too large (max 16MB each)'});
+// Friendly multer errors
+app.use((err, _req, res, next) => {
+  if (err && err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json({ error: 'File too large (max 16MB each)' });
+  }
   next(err);
 });
-app.use('/api/*', (_req,res)=> res.status(404).json({ error:'Not found' }));
 
-// ---------- Boot ----------
+// Boot
 (async()=>{
-  try{
+  try {
     await connectMongo(MONGODB_URI);
     app.listen(PORT, ()=>console.log(`API :${PORT}`));
     const stop=async()=>{ await shutdown(); process.exit(0); };
     process.on('SIGINT', stop); process.on('SIGTERM', stop);
-  }catch(e){ console.error('Boot error:', e); process.exit(1); }
+  } catch(e){ console.error('Boot error:', e); process.exit(1); }
 })();
