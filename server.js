@@ -1,11 +1,13 @@
 // server.js — email-only submission API (Express + Multer + Nodemailer)
+// v1.0.1 (adds SMTP verify + detailed error)
+// Drop-in replacement.
+
 require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
-const multer = require('multer');              // <-- you missed this import
+const multer = require('multer');
 const nodemailer = require('nodemailer');
-const path = require('path');
 
 const {
   PORT = 8080,
@@ -13,7 +15,8 @@ const {
   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS,
   NOTIFY_FROM = 'Maltese First <no-reply@maltesefirst.com>',
   NOTIFY_TO   = 'hello@maltesefirst.com',
-  CORS_ORIGIN = 'https://maltesefirst.com,https://www.maltesefirst.com'
+  CORS_ORIGIN = 'https://maltesefirst.com,https://www.maltesefirst.com',
+  DEBUG_ERRORS = '1'               // keep 1 for now to surface SMTP reasons
 } = process.env;
 
 const app = express();
@@ -29,18 +32,38 @@ app.use(cors({
 }));
 app.options('*', cors());
 
-// Body limits (we only use multipart for this route, but keep json small)
+// Light parsers (multipart handled by multer)
 app.use(express.json({ limit: '64kb' }));
 
-// Multer (memory) for attachments
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 16 * 1024 * 1024 } });
+// Multer in-memory
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 16 * 1024 * 1024 }});
 
 // Health
-app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, env: NODE_ENV, version: 'email-only-1.0.0', uptime: process.uptime() });
+app.get('/api/health', (_req, res) => res.json({ ok: true, env: NODE_ENV, version: 'email-only-1.0.1', uptime: process.uptime() }));
+
+function makeTransport() {
+  if (!SMTP_HOST || !SMTP_PORT || !SMTP_USER || !SMTP_PASS) return null;
+  return nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: Number(SMTP_PORT),
+    secure: Number(SMTP_PORT) === 465,   // 465 = SSL, 587/25 = STARTTLS/plain
+    auth: { user: SMTP_USER, pass: SMTP_PASS }
+  });
+}
+
+// Quick SMTP probe
+app.get('/api/debug/smtp', async (_req, res) => {
+  try {
+    const t = makeTransport();
+    if (!t) return res.status(500).json({ ok:false, error:'SMTP_NOT_CONFIGURED' });
+    await t.verify(); // if this throws you’ll see the cause
+    res.json({ ok:true });
+  } catch (e) {
+    res.status(500).json({ ok:false, error:'SMTP_VERIFY_FAILED', detail:e.message });
+  }
 });
 
-// POST /api/onboarding/email-only  -> sends everything to NOTIFY_TO
+// Email-only intake
 app.post('/api/onboarding/email-only',
   upload.fields([
     { name: 'docs_corporate', maxCount: 30 },
@@ -51,20 +74,16 @@ app.post('/api/onboarding/email-only',
   ]),
   async (req, res) => {
     try {
-      // Mailer
-      if (!SMTP_HOST || !SMTP_PORT || !SMTP_USER || !SMTP_PASS) {
-        return res.status(500).json({ error: 'SMTP not configured' });
-      }
-      const transport = nodemailer.createTransport({
-        host: SMTP_HOST,
-        port: Number(SMTP_PORT),
-        secure: Number(SMTP_PORT) === 465,
-        auth: { user: SMTP_USER, pass: SMTP_PASS }
+      const transport = makeTransport();
+      if (!transport) return res.status(500).json({ error:'SMTP_NOT_CONFIGURED' });
+
+      // Show the exact reason if SMTP is unhappy
+      await transport.verify().catch(e => {
+        throw Object.assign(new Error('SMTP_VERIFY_FAILED'), { cause:e });
       });
 
-      // Build plain-text summary
       const b = req.body || {};
-      const lines = [
+      const summaryLines = [
         'New Account Application (Email-Only)',
         '-----------------------------------',
         `Company / Account Name : ${b.company_name || b.companyName || '-'}`,
@@ -82,7 +101,6 @@ app.post('/api/onboarding/email-only',
         (b.notes || '-')
       ];
 
-      // Collect Multer file fields cleanly
       const collect = (field) => (req.files?.[field] || []).map(f => ({
         filename: f.originalname,
         content:  f.buffer,
@@ -97,25 +115,27 @@ app.post('/api/onboarding/email-only',
         ...collect('selfie_file')
       ];
 
-      const subject = `Account Application — ${b.company_name || b.companyName || 'New Client'}`;
-
       await transport.sendMail({
         from: NOTIFY_FROM,
-        to: NOTIFY_TO,
-        subject,
-        text: lines.join('\n'),
+        to:   NOTIFY_TO,
+        subject: `Account Application — ${b.company_name || b.companyName || 'New Client'}`,
+        text: summaryLines.join('\n'),
         attachments
       });
 
-      res.json({ ok: true, delivered: true });
+      return res.json({ ok:true, delivered:true, attachments: attachments.length });
     } catch (e) {
-      console.error('email-only submit failed:', e);
-      res.status(500).json({ error: 'Server error' });
+      console.error('email-only submit failed:', e?.cause?.message || e?.message || e);
+      // Surface the SMTP reason while we’re debugging
+      if (DEBUG_ERRORS === '1') {
+        return res.status(500).json({
+          error: e.message || 'Server error',
+          detail: (e.cause && e.cause.message) || undefined
+        });
+      }
+      return res.status(500).json({ error:'Server error' });
     }
   }
 );
 
-// Boot
-app.listen(PORT, () => {
-  console.log(`Email-only API listening on :${PORT}`);
-});
+app.listen(PORT, () => console.log(`Email-only API listening on :${PORT}`));
