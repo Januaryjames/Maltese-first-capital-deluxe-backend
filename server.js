@@ -1,9 +1,6 @@
 // server.js — Maltese First Capital API (v1.9.7)
-// Includes:
-//  A) /api/admin/set-user-name  (set company as holder)
-//  B) /api/client/overview      (holder + authorisedPerson + accounts w/ lines)
-// Keeps: auth, onboarding (dual field/file support), contact, admin apps, GridFS, rate limit, ClamAV.
-// CSP disabled; CORS restricted to configured origins.
+// CORS fixed (allows x-seed-key) + seed key can be sent in BODY/query
+// Turnstile optional; GridFS for uploads; simple mailer; dev seed helpers.
 
 require('dotenv').config();
 const express = require('express');
@@ -15,10 +12,10 @@ const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const nodemailer = require('nodemailer');
 const { randomUUID, createHash } = require('crypto');
-const net = require('net');
 const mongoose = require('mongoose');
 const { MongoClient, GridFSBucket } = require('mongodb');
 
+// ─────────── ENV
 const {
   PORT = 8080,
   NODE_ENV = 'production',
@@ -28,15 +25,15 @@ const {
   TURNSTILE_SECRET,
   BYPASS_CAPTCHA = '0',
   DEV_SEED_KEY,
+
   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS,
   NOTIFY_FROM = 'Maltese First <no-reply@maltesefirst.com>',
-  NOTIFY_TO = '',
-  CLAMAV_HOST, CLAMAV_PORT = 3310
+  NOTIFY_TO = ''
 } = process.env;
 
 if (!MONGODB_URI) throw new Error('MONGODB_URI missing');
 
-// ───────────────── Mailer (optional)
+// ─────────── Mailer (optional)
 let mailer = null;
 if (SMTP_HOST && SMTP_PORT && SMTP_USER && SMTP_PASS) {
   mailer = nodemailer.createTransport({
@@ -52,21 +49,21 @@ async function sendNotify(subject, html) {
   catch (e) { console.warn('notify mail failed:', e.message); }
 }
 
-// ───────────────── App
+// ─────────── App
 const app = express();
 app.set('trust proxy', 1);
 
-// CORS (exact origins only) + preflight
+// CORS (exact origins only) + allow x-seed-key
 const ALLOWED = CORS_ORIGIN.split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
   origin: (origin, cb) => (!origin || ALLOWED.includes(origin)) ? cb(null, true) : cb(new Error('Not allowed by CORS')),
   credentials: true,
   methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization','X-Requested-With']
+  allowedHeaders: ['Content-Type','Authorization','X-Requested-With','x-seed-key']
 }));
 app.options('*', cors());
 
-// Helmet — CSP disabled per current rollout
+// Helmet — CSP off (frontend loads third-party scripts)
 app.use(helmet({
   contentSecurityPolicy: false,
   crossOriginResourcePolicy: { policy: 'cross-origin' }
@@ -74,9 +71,9 @@ app.use(helmet({
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true, limit: '2mb' }));
-app.use('/api/', rateLimit({ windowMs: 10*60*1000, max: 100, standardHeaders: true, legacyHeaders: false }));
+app.use('/api/', rateLimit({ windowMs: 10*60*1000, max: 120, standardHeaders: true, legacyHeaders: false }));
 
-// ───────────────── Mongo + GridFS
+// ─────────── Mongo + GridFS
 let gfsBucket = null, nativeClient = null;
 async function connectMongo(uri) {
   await mongoose.connect(uri, { maxPoolSize: 20 });
@@ -88,19 +85,18 @@ async function connectMongo(uri) {
 function getGridFSBucket(){ if (!gfsBucket) throw new Error('GridFS not ready'); return gfsBucket; }
 async function shutdown(){ await mongoose.disconnect().catch(()=>{}); if (nativeClient) await nativeClient.close().catch(()=>{}); }
 
-// ───────────────── Schemas
+// ─────────── Schemas
 const User = mongoose.model('User', new mongoose.Schema({
   email: { type:String, unique:true, index:true, required:true, lowercase:true, trim:true },
   passwordHash: { type:String, required:true },
   role: { type:String, enum:['client','admin'], default:'client', index:true },
-  name: { type:String, trim:true } // we will use this as the COMPANY/HOLDER display
+  name: { type:String, trim:true }
 },{timestamps:true}));
 
 const FileMetaSchema = new mongoose.Schema({
   gridfsId: mongoose.Schema.Types.ObjectId,
   filename: String, mime: String, size: Number,
-  sha256: String,
-  av: { status: String, engine: String, reason: String }
+  sha256: String
 },{_id:false});
 
 const Application = mongoose.model('Application', new mongoose.Schema({
@@ -148,7 +144,7 @@ const ContactMessage = mongoose.model('ContactMessage', new mongoose.Schema({
   meta:{ userAgent:String, ip:String }
 },{timestamps:true}));
 
-// ───────────────── Helpers
+// ─────────── Helpers
 function makeToken(u){ return jwt.sign({ sub:u.id, role:u.role, name:u.name }, JWT_SECRET, { expiresIn:'1h' }); }
 function authRequired(role){
   return (req,res,next)=>{
@@ -158,51 +154,32 @@ function authRequired(role){
     catch{ return res.status(401).json({error:'Invalid token'}); }
   };
 }
+function genAccountNo(){ return String(Math.floor(10_000_000 + Math.random()*90_000_000)); }
+function tryObjectId(str){ try { return new mongoose.Types.ObjectId(str); } catch { return null; } }
+
+// Accept seed key from header OR body OR query (so browser can call it easily)
+function getSeedKey(req) {
+  return req.headers['x-seed-key'] || req.body?.key || req.query?.key || '';
+}
+
 async function verifyTurnstile(token, ip){
   if (BYPASS_CAPTCHA === '1') return true;
-  if (!TURNSTILE_SECRET) return true; // if not configured, do not block
+  if (!TURNSTILE_SECRET) return true;
   try{
     const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
       method:'POST',
       headers:{'content-type':'application/x-www-form-urlencoded'},
       body:`secret=${encodeURIComponent(TURNSTILE_SECRET)}&response=${encodeURIComponent(token||'')}&remoteip=${encodeURIComponent(ip||'')}`
     });
-    const d = await r.json(); 
+    const d = await r.json();
     return !!d.success;
-  }catch{
-    return false;
-  }
-}
-function tryObjectId(str){ try { return new mongoose.Types.ObjectId(str); } catch { return null; } }
-function genAccountNo(){ return String(Math.floor(10_000_000 + Math.random()*90_000_000)); }
-
-// Optional: ClamAV stream scan (skips if not configured)
-async function clamScan(buffer){
-  if(!CLAMAV_HOST) return { status:'skipped', engine:'clamav', reason:'not_configured' };
-  return new Promise((resolve) => {
-    const s = net.createConnection(CLAMAV_PORT, CLAMAV_HOST, () => {
-      s.write("zINSTREAM\0");
-      s.write(Buffer.alloc(4));
-      const len = Buffer.alloc(4); len.writeUInt32BE(buffer.length, 0);
-      s.write(len); s.write(buffer);
-      s.write(Buffer.alloc(4)); // terminator
-    });
-    s.setTimeout(10000);
-    s.on('data', (d) => {
-      const msg = d.toString();
-      if (msg.includes('FOUND')) resolve({ status:'infected', engine:'clamav', reason:msg.trim() });
-      else resolve({ status:'clean', engine:'clamav' });
-      s.end();
-    });
-    s.on('error', () => resolve({ status:'skipped', engine:'clamav', reason:'socket_error' }));
-    s.on('timeout', () => { s.destroy(); resolve({ status:'skipped', engine:'clamav', reason:'timeout' }); });
-  });
+  }catch{ return false; }
 }
 
 // Multer
 const upload = multer({ storage: multer.memoryStorage(), limits:{ fileSize: 16*1024*1024 } });
 
-// ───────────────── Routes
+// ─────────── Routes
 app.get('/api/health', (_req,res)=> res.json({ ok:true, env:NODE_ENV, version:'1.9.7', uptime:process.uptime() }));
 
 // Auth
@@ -227,25 +204,11 @@ app.get('/api/auth/me', authRequired(), async (req,res)=>{
   if(!u) return res.status(404).json({error:'Not found'});
   res.json({ user: { email:u.email, name:u.name, role:u.role, createdAt:u.createdAt } });
 });
-app.post('/api/auth/request-reset', async (req,res)=>{
-  const {email}=req.body||{}; if(!email) return res.status(400).json({error:'Email required'});
-  const token = randomUUID().replace(/-/g,'');
-  const expires = new Date(Date.now()+30*60*1000);
-  await ResetToken.create({ email:email.toLowerCase(), token, expiresAt:expires });
-  res.status(204).end();
-});
-app.post('/api/auth/reset', async (req,res)=>{
-  const {token,newPassword}=req.body||{}; if(!token||!newPassword) return res.status(400).json({error:'Token and newPassword required'});
-  const rt = await ResetToken.findOne({ token, used:false, expiresAt:{ $gt:new Date() } });
-  if(!rt) return res.status(400).json({error:'Invalid or expired token'});
-  const u = await User.findOne({ email:rt.email }); if(!u) return res.status(400).json({error:'No account for token'});
-  u.passwordHash = await bcrypt.hash(newPassword,10); await u.save(); rt.used=true; await rt.save(); res.status(204).end();
-});
 
 // Admin bootstrap (guarded by DEV_SEED_KEY)
 app.post('/api/admin/bootstrap', async (req, res) => {
   try {
-    const key = req.headers['x-seed-key'];
+    const key = getSeedKey(req);
     if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error: 'Forbidden' });
     const { email, password, name = 'Administrator' } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'email and password required' });
@@ -262,28 +225,82 @@ app.post('/api/admin/bootstrap', async (req, res) => {
   }
 });
 
-// ───────────────── Onboarding (KYC) — dual field/file support
-const ALLOWED_MIME = new Set(["application/pdf","image/jpeg","image/png","image/webp"]);
+// Admin: Set/Correct a user's display name (e.g., company name)
+app.post('/api/admin/set-user-name', async (req, res) => {
+  try {
+    const key = getSeedKey(req);
+    if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error: 'Forbidden' });
+    const { email, name } = req.body || {};
+    if (!email || !name) return res.status(400).json({ error: 'email and name required' });
 
-// Accept both old and new file field names
+    const u = await User.findOneAndUpdate(
+      { email: email.toLowerCase(), role: 'client' },
+      { $set: { name } },
+      { new: true }
+    );
+    if (!u) return res.status(404).json({ error: 'Client not found' });
+    res.json({ ok: true, user: { email: u.email, name: u.name } });
+  } catch (e) {
+    console.error('set-user-name error', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Dev: create (or find) a client and optionally seed an account/credit
+app.post('/api/admin/dev-seed-account', async (req,res)=>{
+  const key = getSeedKey(req);
+  if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({error:'Forbidden'});
+
+  const { email, name, password, amount=0, currency='USD', ts, status='active' } = req.body || {};
+  if(!email) return res.status(400).json({error:'email required'});
+
+  let user = await User.findOne({ email: email.toLowerCase() });
+  if (!user) {
+    const pw = password || randomUUID().slice(0,12);
+    user = await User.create({
+      email: email.toLowerCase(),
+      name: name || email.split('@')[0],
+      role: 'client',
+      passwordHash: await bcrypt.hash(pw, 10)
+    });
+  } else if (name) {
+    user.name = name; await user.save();
+  }
+
+  const accountNo = genAccountNo();
+  const when = ts ? new Date(ts) : new Date();
+  const acct = await Account.create({
+    accountNo, owner: user._id, status, currency,
+    balance: amount,
+    lines: amount ? [{ ts: when, type:'credit', amount, currency, description:'Initial Credit', meta:{ source:'admin-seed' } }] : []
+  });
+
+  res.json({ ok:true, user:{ email:user.email, name:user.name }, account:{ accountNo:acct.accountNo, status:acct.status, currency:acct.currency, balance:acct.balance } });
+});
+
+// Client overview (returns real accounts)
+app.get('/api/client/overview', authRequired('client'), async (req,res)=>{
+  const accounts = await Account.find({ owner: req.user.sub }).select('-__v');
+  res.json({ accounts });
+});
+
+// ─────────── Onboarding (KYC) — accepts both field name styles
+const ALLOWED_MIME = new Set(["application/pdf","image/jpeg","image/png","image/webp"]);
 const kycUpload = upload.fields([
-  { name:'passport', maxCount:1 },           // old
-  { name:'proofOfAddress', maxCount:1 },     // old
-  { name:'companyDocs', maxCount:20 },       // old
-  { name:'selfie', maxCount:1 },             // old
-  { name:'docs_id', maxCount:2 },            // new -> passport
-  { name:'docs_poa', maxCount:5 },           // new -> proofOfAddress
-  { name:'docs_corporate', maxCount:20 },    // new -> companyDocs
-  { name:'docs_sof', maxCount:20 },          // new -> append into companyDocs
-  { name:'selfie_file', maxCount:1 }         // new -> selfie
+  { name:'passport', maxCount:1 },
+  { name:'proofOfAddress', maxCount:1 },
+  { name:'companyDocs', maxCount:20 },
+  { name:'selfie', maxCount:1 },
+  { name:'docs_id', maxCount:2 },
+  { name:'docs_poa', maxCount:5 },
+  { name:'docs_corporate', maxCount:20 },
+  { name:'docs_sof', maxCount:20 },
+  { name:'selfie_file', maxCount:1 }
 ]);
 
 function collectFiles(req, names) {
   const out = [];
-  for (const n of names) {
-    const arr = req.files?.[n] || [];
-    out.push(...arr);
-  }
+  for (const n of names) out.push(...(req.files?.[n] || []));
   return out;
 }
 
@@ -299,19 +316,15 @@ async function onboardingHandler(req,res){
     const rawSelfie  = collectFiles(req, ['selfie','selfie_file']);
 
     const gfs = getGridFSBucket();
-
     async function ingest(list){
       const out = [];
       for (const f of list) {
-        if (!ALLOWED_MIME.has(f.mimetype)) {
-          return { error:`Unsupported file type: ${f.mimetype}` };
-        }
+        if (!ALLOWED_MIME.has(f.mimetype)) return { error:`Unsupported file type: ${f.mimetype}` };
         const sha256 = createHash('sha256').update(f.buffer).digest('hex');
-        const av = await clamScan(f.buffer); // may skip
         const filename = `${Date.now()}_${f.originalname}`;
         const us = gfs.openUploadStream(filename,{contentType:f.mimetype}); us.end(f.buffer);
         const fin = await new Promise((resolve,reject)=>{ us.on('finish',resolve); us.on('error',reject); });
-        out.push({ gridfsId:fin._id, filename, mime:f.mimetype, size:f.size, sha256, av });
+        out.push({ gridfsId:fin._id, filename, mime:f.mimetype, size:f.size, sha256 });
       }
       return { out };
     }
@@ -332,7 +345,6 @@ async function onboardingHandler(req,res){
     const notes        = b.notes || '';
 
     const applicationId = randomUUID();
-
     const doc = await Application.create({
       applicationId, status:'received',
       fields:{
@@ -344,12 +356,7 @@ async function onboardingHandler(req,res){
         address, currency, accountType, commercialRegistration, sourceOfFunds, notes,
         extra: b
       },
-      files:{
-        passport: p1.out,
-        proofOfAddress: p2.out,
-        companyDocs: p3.out,
-        selfie: p4.out
-      },
+      files:{ passport:p1.out, proofOfAddress:p2.out, companyDocs:p3.out, selfie:p4.out },
       submittedByIp: req.ip
     });
 
@@ -367,10 +374,8 @@ async function onboardingHandler(req,res){
     return res.status(500).json({ error:'Server error' });
   }
 }
-
-// Mount both routes (alias kept for the frontend wiring)
 app.post('/api/onboarding/submit', kycUpload, onboardingHandler);
-app.post('/api/onboarding/account-open', kycUpload, onboardingHandler);
+app.post('/api/onboarding/account-open', kycUpload, onboardingHandler); // alias
 
 // Contact
 app.post('/api/contact', upload.none(), async (req,res)=>{
@@ -408,67 +413,6 @@ app.get('/api/admin/applications/:id/files/:field/:gridId', authRequired('admin'
   getGridFSBucket().openDownloadStream(oid).on('error',()=>res.status(500).end()).pipe(res);
 });
 
-// ───────────────── A) Admin: set user display name (company holder)
-app.post('/api/admin/set-user-name', async (req, res) => {
-  try {
-    const key = req.headers['x-seed-key'];
-    if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error: 'Forbidden' });
-    const { email, name } = req.body || {};
-    if (!email || !name) return res.status(400).json({ error: 'email and name required' });
-    const u = await User.findOne({ email: email.toLowerCase() });
-    if (!u) return res.status(404).json({ error: 'User not found' });
-    u.name = name.trim();
-    await u.save();
-    res.json({ ok:true, user:{ email:u.email, name:u.name }});
-  } catch (e) {
-    console.error('set-user-name', e);
-    res.status(500).json({ error:'Server error' });
-  }
-});
-
-// ───────────────── B) Client overview (holder + authorisedPerson + accounts)
-app.get('/api/client/overview', authRequired('client'), async (req,res)=>{
-  const u = await User.findById(req.user.sub).select('email name role');
-  if (!u) return res.status(404).json({ error:'Not found' });
-  const accounts = await Account.find({ owner: req.user.sub }).select('-__v');
-
-  const local = (u.email || '').split('@')[0] || '';
-  const authorisedPerson = local.replace(/[._-]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-
-  res.json({
-    holder: u.name || '(Account Holder)',
-    authorisedPerson,
-    accounts
-  });
-});
-
-// Dev seed account (unchanged)
-app.post('/api/admin/dev-seed-account', async (req,res)=>{
-  const key=req.headers['x-seed-key']; if(!DEV_SEED_KEY || key!==DEV_SEED_KEY) return res.status(403).json({error:'Forbidden'});
-  const { email, amount=0, currency='USD', ts, status='active' } = req.body || {};
-  if(!email) return res.status(400).json({error:'email required'});
-
-  let user = await User.findOne({ email: email.toLowerCase() });
-  if (!user) {
-    user = await User.create({
-      email: email.toLowerCase(),
-      name: email.split('@')[0],     // can be overwritten later by set-user-name
-      role: 'client',
-      passwordHash: await bcrypt.hash(randomUUID().slice(0,12), 10)
-    });
-  }
-
-  const accountNo = genAccountNo();
-  const when = ts ? new Date(ts) : new Date();
-  const acct = await Account.create({
-    accountNo, owner: user._id, status, currency,
-    balance: amount,
-    lines: amount ? [{ ts: when, type:'credit', amount, currency, description:'Initial Credit', meta:{ source:'admin-seed' } }] : []
-  });
-
-  res.json({ ok:true, accountNo: acct.accountNo, user: user.email, status: acct.status });
-});
-
 // Friendly multer errors
 app.use((err, _req, res, next) => {
   if (err && err.code === 'LIMIT_FILE_SIZE') {
@@ -477,7 +421,7 @@ app.use((err, _req, res, next) => {
   next(err);
 });
 
-// Boot
+// ─────────── Boot
 (async()=>{
   try {
     await connectMongo(MONGODB_URI);
