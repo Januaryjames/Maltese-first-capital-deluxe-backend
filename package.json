@@ -1,17 +1,14 @@
 {
-  "name": "maltese-first-capital-deluxe-backend",
-  "version": "1.0.0",
-  "main": "server.js",
-  "private": true,
-  "scripts": {
-    "start": "node server.js"
-  },
-  "engines": { "node": ">=18.x" },
+  "name": "mfc-email-only-api",
+  "version": "1.0.1",
+  "type": "commonjs",
+  "engines": { "node": ">=18" },
+  "scripts": { "start": "node server.js" },
   "dependencies": {
     "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
+    "dotenv": "^16.4.1",
     "express": "^4.19.2",
-    "multer": "^1.4.5-lts.2",
-    "nodemailer": "^6.9.15"
+    "multer": "^1.4.5-lts.1",
+    "nodemailer": "^6.9.13"
   }
 }
