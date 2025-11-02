@@ -1,39 +1,37 @@
-// server.js — Maltese First Capital API (v1.9.7)
-// CORS fixed (allows x-seed-key) + seed key can be sent in BODY/query
-// Turnstile optional; GridFS for uploads; simple mailer; dev seed helpers.
+// server.js — Maltese First Capital (Simplified API)
+// Focus: auth, admin upsert, client overview, email-only onboarding
+// No GridFS, no Helmet, minimal deps; designed for Render.
 
+// ──────────────────────────────────────────────────────────────────────────────
 require('dotenv').config();
 const express = require('express');
-const helmet = require('helmet');
 const cors = require('cors');
-const rateLimit = require('express-rate-limit');
-const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs');
-const multer = require('multer');
-const nodemailer = require('nodemailer');
-const { randomUUID, createHash } = require('crypto');
 const mongoose = require('mongoose');
-const { MongoClient, GridFSBucket } = require('mongodb');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const nodemailer = require('nodemailer');
+const multer = require('multer');
 
-// ─────────── ENV
 const {
   PORT = 8080,
   NODE_ENV = 'production',
   MONGODB_URI,
   JWT_SECRET = 'change_me',
-  CORS_ORIGIN = 'https://maltesefirst.com,https://www.maltesefirst.com',
-  TURNSTILE_SECRET,
-  BYPASS_CAPTCHA = '0',
   DEV_SEED_KEY,
-
+  // CORS (comma-separated)
+  CORS_ORIGIN = 'https://maltesefirst.com,https://www.maltesefirst.com',
+  // SMTP (optional but recommended)
   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS,
   NOTIFY_FROM = 'Maltese First <no-reply@maltesefirst.com>',
-  NOTIFY_TO = ''
+  NOTIFY_TO = 'hello@maltesefirst.com'
 } = process.env;
 
-if (!MONGODB_URI) throw new Error('MONGODB_URI missing');
+if (!MONGODB_URI) {
+  console.error('MONGODB_URI is required'); process.exit(1);
+}
 
-// ─────────── Mailer (optional)
+// ──────────────────────────────────────────────────────────────────────────────
+// Mailer (optional — onboarding/email-only uses this)
 let mailer = null;
 if (SMTP_HOST && SMTP_PORT && SMTP_USER && SMTP_PASS) {
   mailer = nodemailer.createTransport({
@@ -43,75 +41,47 @@ if (SMTP_HOST && SMTP_PORT && SMTP_USER && SMTP_PASS) {
     auth: { user: SMTP_USER, pass: SMTP_PASS }
   });
 }
-async function sendNotify(subject, html) {
-  if (!mailer || !NOTIFY_TO) return;
-  try { await mailer.sendMail({ from: NOTIFY_FROM, to: NOTIFY_TO, subject, html }); }
-  catch (e) { console.warn('notify mail failed:', e.message); }
+async function sendMail(subject, html, attachments = []) {
+  if (!mailer) return { ok:false, delivered:false, reason:'mailer_not_configured' };
+  const info = await mailer.sendMail({
+    from: NOTIFY_FROM,
+    to: NOTIFY_TO,
+    subject, html,
+    attachments
+  });
+  return { ok:true, delivered:true, messageId: info.messageId, attachments: attachments.length };
 }
 
-// ─────────── App
+// ──────────────────────────────────────────────────────────────────────────────
+// App + CORS
 const app = express();
 app.set('trust proxy', 1);
 
-// CORS (exact origins only) + allow x-seed-key
 const ALLOWED = CORS_ORIGIN.split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
   origin: (origin, cb) => (!origin || ALLOWED.includes(origin)) ? cb(null, true) : cb(new Error('Not allowed by CORS')),
-  credentials: true,
-  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization','X-Requested-With','x-seed-key']
+  credentials: false,
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','x-seed-key']
 }));
 app.options('*', cors());
 
-// Helmet — CSP off (frontend loads third-party scripts)
-app.use(helmet({
-  contentSecurityPolicy: false,
-  crossOriginResourcePolicy: { policy: 'cross-origin' }
-}));
+app.use(express.json({ limit:'4mb' }));
+app.use(express.urlencoded({ extended:true, limit:'4mb' }));
 
-app.use(express.json({ limit: '2mb' }));
-app.use(express.urlencoded({ extended: true, limit: '2mb' }));
-app.use('/api/', rateLimit({ windowMs: 10*60*1000, max: 120, standardHeaders: true, legacyHeaders: false }));
+// Multer (in-memory) for email-only attachments
+const uploadAny = multer({ storage: multer.memoryStorage(), limits:{ fileSize: 16 * 1024 * 1024 } });
 
-// ─────────── Mongo + GridFS
-let gfsBucket = null, nativeClient = null;
-async function connectMongo(uri) {
-  await mongoose.connect(uri, { maxPoolSize: 20 });
-  nativeClient = new MongoClient(uri); await nativeClient.connect();
-  const dbName = mongoose.connection.name;
-  gfsBucket = new GridFSBucket(nativeClient.db(dbName), { bucketName: 'uploads' });
-  console.log('Mongo connected:', dbName);
-}
-function getGridFSBucket(){ if (!gfsBucket) throw new Error('GridFS not ready'); return gfsBucket; }
-async function shutdown(){ await mongoose.disconnect().catch(()=>{}); if (nativeClient) await nativeClient.close().catch(()=>{}); }
+// ──────────────────────────────────────────────────────────────────────────────
+// Mongo + Models
+(async () => { await mongoose.connect(MONGODB_URI, { maxPoolSize: 20 }); console.log('Mongo connected'); })()
+.catch(e => { console.error('Mongo connect failed:', e); process.exit(1); });
 
-// ─────────── Schemas
 const User = mongoose.model('User', new mongoose.Schema({
   email: { type:String, unique:true, index:true, required:true, lowercase:true, trim:true },
   passwordHash: { type:String, required:true },
   role: { type:String, enum:['client','admin'], default:'client', index:true },
   name: { type:String, trim:true }
-},{timestamps:true}));
-
-const FileMetaSchema = new mongoose.Schema({
-  gridfsId: mongoose.Schema.Types.ObjectId,
-  filename: String, mime: String, size: Number,
-  sha256: String
-},{_id:false});
-
-const Application = mongoose.model('Application', new mongoose.Schema({
-  applicationId:{ type:String, unique:true, index:true },
-  status:{ type:String, enum:['received','review','approved','rejected'], default:'received' },
-  fields:{
-    fullName:String, email:String, phone:String,
-    companyName:String, country:String,
-    address:String, currency:String,
-    accountType:String, commercialRegistration:String,
-    sourceOfFunds:String, notes:String,
-    extra: mongoose.Schema.Types.Mixed
-  },
-  files:{ passport:[FileMetaSchema], proofOfAddress:[FileMetaSchema], companyDocs:[FileMetaSchema], selfie:[FileMetaSchema] },
-  submittedByIp:String
 },{timestamps:true}));
 
 const TxnSchema = new mongoose.Schema({
@@ -124,28 +94,18 @@ const TxnSchema = new mongoose.Schema({
 }, { _id: false });
 
 const Account = mongoose.model('Account', new mongoose.Schema({
-  accountNo: { type: String, unique: true, index: true },   // 8-digit
-  owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
-  status: { type: String, enum: ['not_activated','active','suspended'], default: 'not_activated', index: true },
-  currency: { type: String, default: 'USD' },
-  balance: { type: Number, default: 0 },
+  accountNo: { type:String, unique:true, index:true },   // 8-digit
+  owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index:true },
+  holderName: { type:String, trim:true },                // Company / Account Holder
+  status: { type:String, enum:['not_activated','active','suspended'], default:'not_activated', index:true },
+  currency: { type:String, default:'USD' },
+  balance: { type:Number, default:0 },
   lines: [TxnSchema]
-}, { timestamps: true }));
-
-const ResetToken = mongoose.model('ResetToken', new mongoose.Schema({
-  email:{ type:String, index:true, required:true, lowercase:true, trim:true },
-  token:{ type:String, required:true, unique:true },
-  used:{ type:Boolean, default:false },
-  expiresAt:{ type:Date, index:true }
 },{timestamps:true}));
 
-const ContactMessage = mongoose.model('ContactMessage', new mongoose.Schema({
-  name:String, email:String, phone:String, subject:String, message:String,
-  meta:{ userAgent:String, ip:String }
-},{timestamps:true}));
-
-// ─────────── Helpers
-function makeToken(u){ return jwt.sign({ sub:u.id, role:u.role, name:u.name }, JWT_SECRET, { expiresIn:'1h' }); }
+// ──────────────────────────────────────────────────────────────────────────────
+// Helpers
+function makeToken(u){ return jwt.sign({ sub:u.id, role:u.role, name:u.name }, JWT_SECRET, { expiresIn:'12h' }); }
 function authRequired(role){
   return (req,res,next)=>{
     const hdr=req.headers.authorization||''; const t=hdr.startsWith('Bearer ')?hdr.slice(7):null;
@@ -154,279 +114,207 @@ function authRequired(role){
     catch{ return res.status(401).json({error:'Invalid token'}); }
   };
 }
-function genAccountNo(){ return String(Math.floor(10_000_000 + Math.random()*90_000_000)); }
-function tryObjectId(str){ try { return new mongoose.Types.ObjectId(str); } catch { return null; } }
-
-// Accept seed key from header OR body OR query (so browser can call it easily)
-function getSeedKey(req) {
-  return req.headers['x-seed-key'] || req.body?.key || req.query?.key || '';
+async function genAccountNoUnique() {
+  for (let i=0;i<20;i++){
+    const n = String(Math.floor(10_000_000 + Math.random()*90_000_000));
+    if (!(await Account.exists({ accountNo:n }))) return n;
+  }
+  throw new Error('Could not generate unique account number');
 }
 
-async function verifyTurnstile(token, ip){
-  if (BYPASS_CAPTCHA === '1') return true;
-  if (!TURNSTILE_SECRET) return true;
-  try{
-    const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-      method:'POST',
-      headers:{'content-type':'application/x-www-form-urlencoded'},
-      body:`secret=${encodeURIComponent(TURNSTILE_SECRET)}&response=${encodeURIComponent(token||'')}&remoteip=${encodeURIComponent(ip||'')}`
-    });
-    const d = await r.json();
-    return !!d.success;
-  }catch{ return false; }
-}
+// ──────────────────────────────────────────────────────────────────────────────
+// Health
+app.get('/api/health', (_req,res)=> res.json({ ok:true, env:NODE_ENV, version:'simple-1.0.0', uptime:process.uptime() }));
 
-// Multer
-const upload = multer({ storage: multer.memoryStorage(), limits:{ fileSize: 16*1024*1024 } });
-
-// ─────────── Routes
-app.get('/api/health', (_req,res)=> res.json({ ok:true, env:NODE_ENV, version:'1.9.7', uptime:process.uptime() }));
-
-// Auth
+// ──────────────────────────────────────────────────────────────────────────────
+// Auth (client + admin)
 app.post('/api/auth/login', async (req,res)=>{
-  const {email,password}=req.body||{};
+  const { email, password } = req.body || {};
   const u = await User.findOne({ email:(email||'').toLowerCase(), role:'client' });
   if(!u) return res.status(400).json({error:'Invalid credentials'});
   const ok = await bcrypt.compare(password||'', u.passwordHash);
   if(!ok) return res.status(400).json({error:'Invalid credentials'});
-  res.json({ token:makeToken(u), user:{ id:u.id, name:u.name, role:u.role } });
+  res.json({ token:makeToken(u), user:{ email:u.email, name:u.name, role:u.role } });
 });
 app.post('/api/admin/login', async (req,res)=>{
-  const {email,password}=req.body||{};
+  const { email, password } = req.body || {};
   const u = await User.findOne({ email:(email||'').toLowerCase(), role:'admin' });
   if(!u) return res.status(400).json({error:'Invalid credentials'});
   const ok = await bcrypt.compare(password||'', u.passwordHash);
   if(!ok) return res.status(400).json({error:'Invalid credentials'});
-  res.json({ token:makeToken(u), user:{ id:u.id, name:u.name, role:u.role } });
+  res.json({ token:makeToken(u), user:{ email:u.email, name:u.name, role:u.role } });
 });
 app.get('/api/auth/me', authRequired(), async (req,res)=>{
   const u = await User.findById(req.user.sub).select('email name role createdAt');
   if(!u) return res.status(404).json({error:'Not found'});
-  res.json({ user: { email:u.email, name:u.name, role:u.role, createdAt:u.createdAt } });
+  res.json({ user:u });
 });
 
-// Admin bootstrap (guarded by DEV_SEED_KEY)
-app.post('/api/admin/bootstrap', async (req, res) => {
-  try {
-    const key = getSeedKey(req);
-    if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error: 'Forbidden' });
-    const { email, password, name = 'Administrator' } = req.body || {};
-    if (!email || !password) return res.status(400).json({ error: 'email and password required' });
+// ──────────────────────────────────────────────────────────────────────────────
+// Admin bootstrap (seed key)
+app.post('/api/admin/bootstrap', async (req,res)=>{
+  const key = req.headers['x-seed-key'];
+  if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error:'Forbidden' });
+  const { email, password, name='Administrator' } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error:'email and password required' });
+  const exists = await User.findOne({ email:email.toLowerCase(), role:'admin' });
+  if (exists) return res.json({ ok:true, already:true });
+  const passwordHash = await bcrypt.hash(password, 10);
+  await User.create({ email:email.toLowerCase(), passwordHash, role:'admin', name });
+  res.json({ ok:true });
+});
 
-    const exists = await User.findOne({ email: email.toLowerCase(), role: 'admin' });
-    if (exists) return res.status(409).json({ error: 'Admin already exists' });
+// Admin: upsert client + create account (easiest path)
+app.post('/api/admin/upsert-client', async (req,res)=>{
+  const key = req.headers['x-seed-key'];
+  if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error:'Forbidden' });
 
-    const passwordHash = await bcrypt.hash(password, 10);
-    await User.create({ email: email.toLowerCase(), name, role: 'admin', passwordHash });
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('bootstrap-admin error', e);
-    res.status(500).json({ error: 'Server error' });
+  const {
+    email, password, name,
+    companyName,       // will be Account holderName
+    createAccount = true,
+    status = 'active', currency = 'USD',
+    amount = 0,        // opening balance (credit)
+    ts                 // optional timestamp for the credit
+  } = req.body || {};
+
+  if (!email || !password || !name || !companyName) {
+    return res.status(400).json({ error:'email, password, name, companyName required' });
   }
-});
 
-// Admin: Set/Correct a user's display name (e.g., company name)
-app.post('/api/admin/set-user-name', async (req, res) => {
-  try {
-    const key = getSeedKey(req);
-    if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error: 'Forbidden' });
-    const { email, name } = req.body || {};
-    if (!email || !name) return res.status(400).json({ error: 'email and name required' });
-
-    const u = await User.findOneAndUpdate(
-      { email: email.toLowerCase(), role: 'client' },
-      { $set: { name } },
-      { new: true }
-    );
-    if (!u) return res.status(404).json({ error: 'Client not found' });
-    res.json({ ok: true, user: { email: u.email, name: u.name } });
-  } catch (e) {
-    console.error('set-user-name error', e);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
-// Dev: create (or find) a client and optionally seed an account/credit
-app.post('/api/admin/dev-seed-account', async (req,res)=>{
-  const key = getSeedKey(req);
-  if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({error:'Forbidden'});
-
-  const { email, name, password, amount=0, currency='USD', ts, status='active' } = req.body || {};
-  if(!email) return res.status(400).json({error:'email required'});
-
+  // user
   let user = await User.findOne({ email: email.toLowerCase() });
   if (!user) {
-    const pw = password || randomUUID().slice(0,12);
     user = await User.create({
       email: email.toLowerCase(),
-      name: name || email.split('@')[0],
+      name,
       role: 'client',
-      passwordHash: await bcrypt.hash(pw, 10)
+      passwordHash: await bcrypt.hash(password, 10),
     });
-  } else if (name) {
-    user.name = name; await user.save();
+  } else {
+    // update name/password if provided
+    const patch = {};
+    if (name) patch.name = name;
+    if (password) patch.passwordHash = await bcrypt.hash(password, 10);
+    if (Object.keys(patch).length) { Object.assign(user, patch); await user.save(); }
   }
 
-  const accountNo = genAccountNo();
-  const when = ts ? new Date(ts) : new Date();
-  const acct = await Account.create({
-    accountNo, owner: user._id, status, currency,
-    balance: amount,
-    lines: amount ? [{ ts: when, type:'credit', amount, currency, description:'Initial Credit', meta:{ source:'admin-seed' } }] : []
-  });
+  let account = null;
+  if (createAccount) {
+    account = await Account.findOne({ owner: user._id });
+    if (!account) {
+      account = await Account.create({
+        accountNo: await genAccountNoUnique(),
+        owner: user._id,
+        holderName: companyName,
+        status, currency,
+        balance: 0,
+        lines: []
+      });
+    }
+    // ensure holder & status
+    account.holderName = companyName;
+    account.status = status;
+    account.currency = currency;
 
-  res.json({ ok:true, user:{ email:user.email, name:user.name }, account:{ accountNo:acct.accountNo, status:acct.status, currency:acct.currency, balance:acct.balance } });
+    // opening credit if amount > 0 and not already present
+    if (amount > 0 && !account.lines.some(l => l.meta && l.meta.kind === 'opening')) {
+      const when = ts ? new Date(ts) : new Date();
+      account.lines.push({
+        ts: when, type: 'credit', amount, currency,
+        description: 'Opening Credit',
+        meta: { kind: 'opening', source: 'admin-upsert' }
+      });
+      account.balance = (account.balance || 0) + Number(amount);
+    }
+    await account.save();
+  }
+
+  res.json({
+    ok: true,
+    user: { email: user.email, name: user.name },
+    account: account ? {
+      accountNo: account.accountNo,
+      holderName: account.holderName,
+      status: account.status,
+      currency: account.currency,
+      balance: account.balance
+    } : null
+  });
 });
 
-// Client overview (returns real accounts)
+// Admin: light setters (company holder / user display name)
+app.post('/api/admin/set-user-name', async (req,res)=>{
+  const key = req.headers['x-seed-key'];
+  if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error:'Forbidden' });
+  const { email, name } = req.body || {};
+  if (!email || !name) return res.status(400).json({ error:'email and name required' });
+  const u = await User.findOneAndUpdate({ email: email.toLowerCase() }, { $set:{ name } }, { new:true }).select('email name');
+  if (!u) return res.status(404).json({ error:'User not found' });
+  res.json({ ok:true, user:u });
+});
+
+app.post('/api/admin/set-account-holder', async (req,res)=>{
+  const key = req.headers['x-seed-key'];
+  if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error:'Forbidden' });
+  const { email, holderName } = req.body || {};
+  if (!email || !holderName) return res.status(400).json({ error:'email and holderName required' });
+  const u = await User.findOne({ email: email.toLowerCase() }).select('_id');
+  if (!u) return res.status(404).json({ error:'User not found' });
+  const acct = await Account.findOneAndUpdate({ owner:u._id }, { $set:{ holderName } }, { new:true })
+               .select('accountNo holderName');
+  if (!acct) return res.status(404).json({ error:'Account not found' });
+  res.json({ ok:true, account:acct });
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Client: overview (JWT)
 app.get('/api/client/overview', authRequired('client'), async (req,res)=>{
-  const accounts = await Account.find({ owner: req.user.sub }).select('-__v');
+  const accounts = await Account.find({ owner: req.user.sub })
+                    .select('accountNo holderName status currency balance lines createdAt updatedAt')
+                    .sort({ createdAt: -1 });
   res.json({ accounts });
 });
 
-// ─────────── Onboarding (KYC) — accepts both field name styles
-const ALLOWED_MIME = new Set(["application/pdf","image/jpeg","image/png","image/webp"]);
-const kycUpload = upload.fields([
-  { name:'passport', maxCount:1 },
-  { name:'proofOfAddress', maxCount:1 },
-  { name:'companyDocs', maxCount:20 },
-  { name:'selfie', maxCount:1 },
-  { name:'docs_id', maxCount:2 },
-  { name:'docs_poa', maxCount:5 },
-  { name:'docs_corporate', maxCount:20 },
-  { name:'docs_sof', maxCount:20 },
-  { name:'selfie_file', maxCount:1 }
-]);
-
-function collectFiles(req, names) {
-  const out = [];
-  for (const n of names) out.push(...(req.files?.[n] || []));
-  return out;
-}
-
-async function onboardingHandler(req,res){
+// ──────────────────────────────────────────────────────────────────────────────
+// Onboarding — Email Only (files become attachments)
+app.post('/api/onboarding/email-only', uploadAny.any(), async (req,res)=>{
   try{
-    const tsToken = req.body?.['cf_turnstile_response'] || req.body?.['cf-turnstile-response'] || '';
-    const ok = await verifyTurnstile(tsToken, req.ip);
-    if(!ok) return res.status(400).json({error:'Captcha verification failed'});
-
-    const rawPassport = collectFiles(req, ['passport','docs_id']);
-    const rawPOA     = collectFiles(req, ['proofOfAddress','docs_poa']);
-    const rawCorp    = collectFiles(req, ['companyDocs','docs_corporate','docs_sof']);
-    const rawSelfie  = collectFiles(req, ['selfie','selfie_file']);
-
-    const gfs = getGridFSBucket();
-    async function ingest(list){
-      const out = [];
-      for (const f of list) {
-        if (!ALLOWED_MIME.has(f.mimetype)) return { error:`Unsupported file type: ${f.mimetype}` };
-        const sha256 = createHash('sha256').update(f.buffer).digest('hex');
-        const filename = `${Date.now()}_${f.originalname}`;
-        const us = gfs.openUploadStream(filename,{contentType:f.mimetype}); us.end(f.buffer);
-        const fin = await new Promise((resolve,reject)=>{ us.on('finish',resolve); us.on('error',reject); });
-        out.push({ gridfsId:fin._id, filename, mime:f.mimetype, size:f.size, sha256 });
-      }
-      return { out };
-    }
-
-    const p1 = await ingest(rawPassport); if (p1.error) return res.status(415).json({ error:p1.error });
-    const p2 = await ingest(rawPOA);     if (p2.error) return res.status(415).json({ error:p2.error });
-    const p3 = await ingest(rawCorp);    if (p3.error) return res.status(415).json({ error:p3.error });
-    const p4 = await ingest(rawSelfie);  if (p4.error) return res.status(415).json({ error:p4.error });
-
     const b = req.body || {};
-    const fullName     = b.fullName || b.authorized_person || b.authorised_person || '';
-    const companyName  = b.companyName || b.company_name || '';
-    const address      = b.address || b.company_address || '';
-    const currency     = b.currency || '';
-    const accountType  = b.accountType || b.account_type || '';
-    const commercialRegistration = b.commercialRegistration || b.commercial_registration || '';
-    const sourceOfFunds = b.sourceOfFunds || b.source_of_funds || '';
-    const notes        = b.notes || '';
+    const fields = Object.entries(b)
+        .map(([k,v]) => `<tr><td style="padding:6px 10px;border-bottom:1px solid #eee;"><b>${k}</b></td><td style="padding:6px 10px;border-bottom:1px solid #eee;">${String(v).replace(/[<>&]/g, s => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[s]))}</td></tr>`)
+        .join('');
+    const html = `
+      <div style="font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif">
+        <h2>New Account Application</h2>
+        <table style="border-collapse:collapse;border:1px solid #eee">${fields}</table>
+        <p style="color:#666">Attachments: ${ (req.files||[]).length }</p>
+      </div>`;
 
-    const applicationId = randomUUID();
-    const doc = await Application.create({
-      applicationId, status:'received',
-      fields:{
-        fullName,
-        email: b.email || '',
-        phone: b.phone || '',
-        companyName,
-        country: b.country || '',
-        address, currency, accountType, commercialRegistration, sourceOfFunds, notes,
-        extra: b
-      },
-      files:{ passport:p1.out, proofOfAddress:p2.out, companyDocs:p3.out, selfie:p4.out },
-      submittedByIp: req.ip
-    });
+    const attachments = (req.files||[]).map(f => ({
+      filename: f.originalname,
+      content: f.buffer,
+      contentType: f.mimetype
+    }));
 
-    sendNotify('New Account Application', `
-      <h3>New Application Received</h3>
-      <p><b>ID:</b> ${doc.applicationId}</p>
-      <p><b>Company:</b> ${companyName||'-'}<br/>
-         <b>Contact:</b> ${fullName||'-'} · ${b.email||'-'} · ${b.phone||'-'}<br/>
-         <b>Country:</b> ${b.country||'-'}</p>
-    `).catch(()=>{});
-
-    return res.status(202).json({ applicationId:doc.applicationId, status:doc.status, receivedAt:doc.createdAt });
+    const result = await sendMail('New Account Application (Email Only)', html, attachments);
+    if (!result.ok) return res.status(500).json({ ok:false, error:'MAIL_FAILED' });
+    res.json(result);
   }catch(e){
-    console.error('onboarding submit error:', e);
-    return res.status(500).json({ error:'Server error' });
+    console.error('email-only error:', e);
+    res.status(500).json({ error:'Server error' });
   }
-}
-app.post('/api/onboarding/submit', kycUpload, onboardingHandler);
-app.post('/api/onboarding/account-open', kycUpload, onboardingHandler); // alias
-
-// Contact
-app.post('/api/contact', upload.none(), async (req,res)=>{
-  const tsToken = req.body?.['cf_turnstile_response'] || req.body?.['cf-turnstile-response'] || '';
-  const ok = await verifyTurnstile(tsToken, req.ip);
-  if(!ok) return res.status(400).json({error:'Captcha verification failed'});
-  const { name='', email='', phone='', subject='', message='' } = req.body||{};
-  await ContactMessage.create({ name, email, phone, subject, message, meta:{ userAgent:req.headers['user-agent']||'', ip:req.ip } });
-  sendNotify('New Contact Message', `
-    <h3>New Contact Message</h3>
-    <p><b>Name:</b> ${name} · <b>Email:</b> ${email} · <b>Phone:</b> ${phone}</p>
-    <p><b>Subject:</b> ${subject}</p>
-    <pre>${(message||'').replace(/[<>&]/g, s => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[s]))}</pre>
-  `).catch(()=>{});
-  res.status(204).end();
 });
 
-// Admin: list, detail, file download
-app.get('/api/admin/applications', authRequired('admin'), async (_req,res)=>{
-  const items = await Application.find().sort({ createdAt:-1 }).limit(100);
-  res.json({ items });
-});
-app.get('/api/admin/applications/:id', authRequired('admin'), async (req,res)=>{
-  const item = await Application.findOne({ applicationId: req.params.id });
-  if(!item) return res.status(404).json({error:'Not found'}); res.json({ item });
-});
-app.get('/api/admin/applications/:id/files/:field/:gridId', authRequired('admin'), async (req,res)=>{
-  const { id, field, gridId }=req.params;
-  const appDoc = await Application.findOne({ applicationId:id }); if(!appDoc) return res.status(404).json({error:'Application not found'});
-  const arr=(appDoc.files && appDoc.files[field])||[]; const meta=arr.find(f=>String(f.gridfsId)===gridId);
-  if(!meta) return res.status(404).json({error:'File not found'});
-  const oid=tryObjectId(gridId); if(!oid) return res.status(400).json({error:'Bad file id'});
-  res.setHeader('Content-Type', meta.mime || 'application/octet-stream');
-  res.setHeader('Content-Disposition', `attachment; filename="${meta.filename || 'file'}"`);
-  getGridFSBucket().openDownloadStream(oid).on('error',()=>res.status(500).end()).pipe(res);
+// Compatibility alias: accept multiparts and forward to email flow
+app.post('/api/onboarding/submit', uploadAny.any(), async (req,res)=> {
+  // reuse handler
+  req.url = '/api/onboarding/email-only';
+  app._router.handle(req,res,()=>{});
 });
 
-// Friendly multer errors
-app.use((err, _req, res, next) => {
-  if (err && err.code === 'LIMIT_FILE_SIZE') {
-    return res.status(413).json({ error: 'File too large (max 16MB each)' });
-  }
-  next(err);
-});
-
-// ─────────── Boot
-(async()=>{
-  try {
-    await connectMongo(MONGODB_URI);
-    app.listen(PORT, ()=>console.log(`API :${PORT}`));
-    const stop=async()=>{ await shutdown(); process.exit(0); };
-    process.on('SIGINT', stop); process.on('SIGTERM', stop);
-  } catch(e){ console.error('Boot error:', e); process.exit(1); }
-})();
+// ──────────────────────────────────────────────────────────────────────────────
+// Boot
+const server = app.listen(PORT, ()=> console.log(`API listening on :${PORT}`));
+process.on('SIGTERM', ()=> server.close(()=>process.exit(0)));
+process.on('SIGINT',  ()=> server.close(()=>process.exit(0)));
