@@ -1,72 +1,124 @@
-// server.js — MFC "easy" API (v1.0)
-// Minimal endpoints: health, admin bootstrap/login, client login,
-// upsert-client (create/update user + account), client overview.
-// Deps: express, mongoose, bcryptjs, jsonwebtoken
+// server.js — Maltese First Capital API (v1.9.7)
+// Includes:
+//  A) /api/admin/set-user-name  (set company as holder)
+//  B) /api/client/overview      (holder + authorisedPerson + accounts w/ lines)
+// Keeps: auth, onboarding (dual field/file support), contact, admin apps, GridFS, rate limit, ClamAV.
+// CSP disabled; CORS restricted to configured origins.
 
 require('dotenv').config();
 const express = require('express');
-const mongoose = require('mongoose');
-const bcrypt = require('bcryptjs');
+const helmet = require('helmet');
+const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const multer = require('multer');
+const nodemailer = require('nodemailer');
+const { randomUUID, createHash } = require('crypto');
+const net = require('net');
+const mongoose = require('mongoose');
+const { MongoClient, GridFSBucket } = require('mongodb');
 
-// ─────────────────────────────────────────────────────────── Env
 const {
   PORT = 8080,
   NODE_ENV = 'production',
+  MONGODB_URI,
   JWT_SECRET = 'change_me',
-  DEV_SEED_KEY = '',
   CORS_ORIGIN = 'https://maltesefirst.com,https://www.maltesefirst.com',
+  TURNSTILE_SECRET,
+  BYPASS_CAPTCHA = '0',
+  DEV_SEED_KEY,
+  SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS,
+  NOTIFY_FROM = 'Maltese First <no-reply@maltesefirst.com>',
+  NOTIFY_TO = '',
+  CLAMAV_HOST, CLAMAV_PORT = 3310
 } = process.env;
 
-const MONGODB_URI = process.env.MONGODB_URI || process.env.MONGO_URI;
-if (!MONGODB_URI) {
-  console.error('❌ MONGODB_URI (or MONGO_URI) is required');
-  process.exit(1);
+if (!MONGODB_URI) throw new Error('MONGODB_URI missing');
+
+// ───────────────── Mailer (optional)
+let mailer = null;
+if (SMTP_HOST && SMTP_PORT && SMTP_USER && SMTP_PASS) {
+  mailer = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: Number(SMTP_PORT),
+    secure: Number(SMTP_PORT) === 465,
+    auth: { user: SMTP_USER, pass: SMTP_PASS }
+  });
+}
+async function sendNotify(subject, html) {
+  if (!mailer || !NOTIFY_TO) return;
+  try { await mailer.sendMail({ from: NOTIFY_FROM, to: NOTIFY_TO, subject, html }); }
+  catch (e) { console.warn('notify mail failed:', e.message); }
 }
 
-// ─────────────────────────────────────────────────────────── App
+// ───────────────── App
 const app = express();
 app.set('trust proxy', 1);
-app.use(express.json({ limit: '1mb' }));
 
-// Simple CORS (no external package)
+// CORS (exact origins only) + preflight
 const ALLOWED = CORS_ORIGIN.split(',').map(s => s.trim()).filter(Boolean);
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (!origin || ALLOWED.includes(origin)) {
-    if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
-  }
-  res.setHeader(
-    'Access-Control-Allow-Headers',
-    'Content-Type, Authorization, X-Requested-With, x-seed-key'
-  );
-  res.setHeader(
-    'Access-Control-Allow-Methods',
-    'GET, POST, PUT, PATCH, DELETE, OPTIONS'
-  );
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
-  if (req.method === 'OPTIONS') return res.status(204).end();
-  next();
-});
+app.use(cors({
+  origin: (origin, cb) => (!origin || ALLOWED.includes(origin)) ? cb(null, true) : cb(new Error('Not allowed by CORS')),
+  credentials: true,
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','X-Requested-With']
+}));
+app.options('*', cors());
 
-// ─────────────────────────────────────────────────────────── DB
-let mongoReady = false;
-mongoose.set('strictQuery', true);
-mongoose
-  .connect(MONGODB_URI, { maxPoolSize: 15 })
-  .then(() => { mongoReady = true; console.log('✅ Mongo connected'); })
-  .catch(err => { console.error('❌ Mongo error', err); process.exit(1); });
+// Helmet — CSP disabled per current rollout
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginResourcePolicy: { policy: 'cross-origin' }
+}));
 
-// ─────────────────────────────────────────────────────────── Models
-const userSchema = new mongoose.Schema({
-  email: { type: String, unique: true, index: true, lowercase: true, trim: true, required: true },
-  passwordHash: { type: String, required: true },
-  role: { type: String, enum: ['client','admin'], default: 'client', index: true },
-  name: { type: String, trim: true }
-}, { timestamps: true });
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true, limit: '2mb' }));
+app.use('/api/', rateLimit({ windowMs: 10*60*1000, max: 100, standardHeaders: true, legacyHeaders: false }));
 
-const txnSchema = new mongoose.Schema({
+// ───────────────── Mongo + GridFS
+let gfsBucket = null, nativeClient = null;
+async function connectMongo(uri) {
+  await mongoose.connect(uri, { maxPoolSize: 20 });
+  nativeClient = new MongoClient(uri); await nativeClient.connect();
+  const dbName = mongoose.connection.name;
+  gfsBucket = new GridFSBucket(nativeClient.db(dbName), { bucketName: 'uploads' });
+  console.log('Mongo connected:', dbName);
+}
+function getGridFSBucket(){ if (!gfsBucket) throw new Error('GridFS not ready'); return gfsBucket; }
+async function shutdown(){ await mongoose.disconnect().catch(()=>{}); if (nativeClient) await nativeClient.close().catch(()=>{}); }
+
+// ───────────────── Schemas
+const User = mongoose.model('User', new mongoose.Schema({
+  email: { type:String, unique:true, index:true, required:true, lowercase:true, trim:true },
+  passwordHash: { type:String, required:true },
+  role: { type:String, enum:['client','admin'], default:'client', index:true },
+  name: { type:String, trim:true } // we will use this as the COMPANY/HOLDER display
+},{timestamps:true}));
+
+const FileMetaSchema = new mongoose.Schema({
+  gridfsId: mongoose.Schema.Types.ObjectId,
+  filename: String, mime: String, size: Number,
+  sha256: String,
+  av: { status: String, engine: String, reason: String }
+},{_id:false});
+
+const Application = mongoose.model('Application', new mongoose.Schema({
+  applicationId:{ type:String, unique:true, index:true },
+  status:{ type:String, enum:['received','review','approved','rejected'], default:'received' },
+  fields:{
+    fullName:String, email:String, phone:String,
+    companyName:String, country:String,
+    address:String, currency:String,
+    accountType:String, commercialRegistration:String,
+    sourceOfFunds:String, notes:String,
+    extra: mongoose.Schema.Types.Mixed
+  },
+  files:{ passport:[FileMetaSchema], proofOfAddress:[FileMetaSchema], companyDocs:[FileMetaSchema], selfie:[FileMetaSchema] },
+  submittedByIp:String
+},{timestamps:true}));
+
+const TxnSchema = new mongoose.Schema({
   ts: { type: Date, default: () => new Date() },
   type: { type: String, enum: ['credit','debit'], required: true },
   amount: { type: Number, required: true },
@@ -75,51 +127,127 @@ const txnSchema = new mongoose.Schema({
   meta: Object
 }, { _id: false });
 
-const accountSchema = new mongoose.Schema({
-  accountNo: { type: String, unique: true, index: true },        // 8-digit string
+const Account = mongoose.model('Account', new mongoose.Schema({
+  accountNo: { type: String, unique: true, index: true },   // 8-digit
   owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
-  companyName: { type: String, trim: true },                      // business holder label
   status: { type: String, enum: ['not_activated','active','suspended'], default: 'not_activated', index: true },
   currency: { type: String, default: 'USD' },
   balance: { type: Number, default: 0 },
-  lines: [txnSchema]
-}, { timestamps: true });
+  lines: [TxnSchema]
+}, { timestamps: true }));
 
-const User = mongoose.model('User', userSchema);
-const Account = mongoose.model('Account', accountSchema);
+const ResetToken = mongoose.model('ResetToken', new mongoose.Schema({
+  email:{ type:String, index:true, required:true, lowercase:true, trim:true },
+  token:{ type:String, required:true, unique:true },
+  used:{ type:Boolean, default:false },
+  expiresAt:{ type:Date, index:true }
+},{timestamps:true}));
 
-// ─────────────────────────────────────────────────────────── Helpers
-const makeToken = (u) =>
-  jwt.sign({ sub: u.id, role: u.role, name: u.name }, JWT_SECRET, { expiresIn: '12h' });
+const ContactMessage = mongoose.model('ContactMessage', new mongoose.Schema({
+  name:String, email:String, phone:String, subject:String, message:String,
+  meta:{ userAgent:String, ip:String }
+},{timestamps:true}));
 
-const authRequired = (role) => (req,res,next) => {
-  const hdr = req.headers.authorization || '';
-  const tok = hdr.startsWith('Bearer ') ? hdr.slice(7) : '';
-  if (!tok) return res.status(401).json({ error: 'Missing token' });
-  try {
-    const p = jwt.verify(tok, JWT_SECRET);
-    if (role && p.role !== role) return res.status(403).json({ error: 'Forbidden' });
-    req.user = p; next();
-  } catch {
-    return res.status(401).json({ error: 'Invalid token' });
+// ───────────────── Helpers
+function makeToken(u){ return jwt.sign({ sub:u.id, role:u.role, name:u.name }, JWT_SECRET, { expiresIn:'1h' }); }
+function authRequired(role){
+  return (req,res,next)=>{
+    const hdr=req.headers.authorization||''; const t=hdr.startsWith('Bearer ')?hdr.slice(7):null;
+    if(!t) return res.status(401).json({error:'Missing token'});
+    try{ const p=jwt.verify(t, JWT_SECRET); if(role && p.role!==role) return res.status(403).json({error:'Forbidden'}); req.user=p; next(); }
+    catch{ return res.status(401).json({error:'Invalid token'}); }
+  };
+}
+async function verifyTurnstile(token, ip){
+  if (BYPASS_CAPTCHA === '1') return true;
+  if (!TURNSTILE_SECRET) return true; // if not configured, do not block
+  try{
+    const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method:'POST',
+      headers:{'content-type':'application/x-www-form-urlencoded'},
+      body:`secret=${encodeURIComponent(TURNSTILE_SECRET)}&response=${encodeURIComponent(token||'')}&remoteip=${encodeURIComponent(ip||'')}`
+    });
+    const d = await r.json(); 
+    return !!d.success;
+  }catch{
+    return false;
   }
-};
+}
+function tryObjectId(str){ try { return new mongoose.Types.ObjectId(str); } catch { return null; } }
+function genAccountNo(){ return String(Math.floor(10_000_000 + Math.random()*90_000_000)); }
 
-const genAccountNo = () => String(Math.floor(10_000_000 + Math.random()*90_000_000));
+// Optional: ClamAV stream scan (skips if not configured)
+async function clamScan(buffer){
+  if(!CLAMAV_HOST) return { status:'skipped', engine:'clamav', reason:'not_configured' };
+  return new Promise((resolve) => {
+    const s = net.createConnection(CLAMAV_PORT, CLAMAV_HOST, () => {
+      s.write("zINSTREAM\0");
+      s.write(Buffer.alloc(4));
+      const len = Buffer.alloc(4); len.writeUInt32BE(buffer.length, 0);
+      s.write(len); s.write(buffer);
+      s.write(Buffer.alloc(4)); // terminator
+    });
+    s.setTimeout(10000);
+    s.on('data', (d) => {
+      const msg = d.toString();
+      if (msg.includes('FOUND')) resolve({ status:'infected', engine:'clamav', reason:msg.trim() });
+      else resolve({ status:'clean', engine:'clamav' });
+      s.end();
+    });
+    s.on('error', () => resolve({ status:'skipped', engine:'clamav', reason:'socket_error' }));
+    s.on('timeout', () => { s.destroy(); resolve({ status:'skipped', engine:'clamav', reason:'timeout' }); });
+  });
+}
 
-// ─────────────────────────────────────────────────────────── Routes
-app.get('/api/health', (_req,res) =>
-  res.json({ ok: true, env: NODE_ENV, version: 'easy-1.0', mongo: mongoReady })
-);
+// Multer
+const upload = multer({ storage: multer.memoryStorage(), limits:{ fileSize: 16*1024*1024 } });
 
-// Admin bootstrap (create first admin). Protected by x-seed-key = DEV_SEED_KEY
+// ───────────────── Routes
+app.get('/api/health', (_req,res)=> res.json({ ok:true, env:NODE_ENV, version:'1.9.7', uptime:process.uptime() }));
+
+// Auth
+app.post('/api/auth/login', async (req,res)=>{
+  const {email,password}=req.body||{};
+  const u = await User.findOne({ email:(email||'').toLowerCase(), role:'client' });
+  if(!u) return res.status(400).json({error:'Invalid credentials'});
+  const ok = await bcrypt.compare(password||'', u.passwordHash);
+  if(!ok) return res.status(400).json({error:'Invalid credentials'});
+  res.json({ token:makeToken(u), user:{ id:u.id, name:u.name, role:u.role } });
+});
+app.post('/api/admin/login', async (req,res)=>{
+  const {email,password}=req.body||{};
+  const u = await User.findOne({ email:(email||'').toLowerCase(), role:'admin' });
+  if(!u) return res.status(400).json({error:'Invalid credentials'});
+  const ok = await bcrypt.compare(password||'', u.passwordHash);
+  if(!ok) return res.status(400).json({error:'Invalid credentials'});
+  res.json({ token:makeToken(u), user:{ id:u.id, name:u.name, role:u.role } });
+});
+app.get('/api/auth/me', authRequired(), async (req,res)=>{
+  const u = await User.findById(req.user.sub).select('email name role createdAt');
+  if(!u) return res.status(404).json({error:'Not found'});
+  res.json({ user: { email:u.email, name:u.name, role:u.role, createdAt:u.createdAt } });
+});
+app.post('/api/auth/request-reset', async (req,res)=>{
+  const {email}=req.body||{}; if(!email) return res.status(400).json({error:'Email required'});
+  const token = randomUUID().replace(/-/g,'');
+  const expires = new Date(Date.now()+30*60*1000);
+  await ResetToken.create({ email:email.toLowerCase(), token, expiresAt:expires });
+  res.status(204).end();
+});
+app.post('/api/auth/reset', async (req,res)=>{
+  const {token,newPassword}=req.body||{}; if(!token||!newPassword) return res.status(400).json({error:'Token and newPassword required'});
+  const rt = await ResetToken.findOne({ token, used:false, expiresAt:{ $gt:new Date() } });
+  if(!rt) return res.status(400).json({error:'Invalid or expired token'});
+  const u = await User.findOne({ email:rt.email }); if(!u) return res.status(400).json({error:'No account for token'});
+  u.passwordHash = await bcrypt.hash(newPassword,10); await u.save(); rt.used=true; await rt.save(); res.status(204).end();
+});
+
+// Admin bootstrap (guarded by DEV_SEED_KEY)
 app.post('/api/admin/bootstrap', async (req, res) => {
   try {
-    if (!mongoReady) return res.status(500).json({ error: 'Mongo not configured' });
-    const key = req.headers['x-seed-key'] || '';
+    const key = req.headers['x-seed-key'];
     if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error: 'Forbidden' });
-
-    const { email, password, name='Administrator' } = req.body || {};
+    const { email, password, name = 'Administrator' } = req.body || {};
     if (!email || !password) return res.status(400).json({ error: 'email and password required' });
 
     const exists = await User.findOne({ email: email.toLowerCase(), role: 'admin' });
@@ -129,116 +257,232 @@ app.post('/api/admin/bootstrap', async (req, res) => {
     await User.create({ email: email.toLowerCase(), name, role: 'admin', passwordHash });
     res.json({ ok: true });
   } catch (e) {
-    console.error('bootstrap error', e);
+    console.error('bootstrap-admin error', e);
     res.status(500).json({ error: 'Server error' });
   }
 });
 
-// Admin login
-app.post('/api/admin/login', async (req,res)=>{
-  const { email, password } = req.body || {};
-  const u = await User.findOne({ email: (email||'').toLowerCase(), role: 'admin' });
-  if (!u) return res.status(400).json({ error: 'Invalid credentials' });
-  const ok = await bcrypt.compare(password || '', u.passwordHash);
-  if (!ok) return res.status(400).json({ error: 'Invalid credentials' });
-  res.json({ token: makeToken(u), user: { id: u.id, name: u.name, role: u.role } });
-});
+// ───────────────── Onboarding (KYC) — dual field/file support
+const ALLOWED_MIME = new Set(["application/pdf","image/jpeg","image/png","image/webp"]);
 
-// Client login
-app.post('/api/auth/login', async (req,res)=>{
-  const { email, password } = req.body || {};
-  const u = await User.findOne({ email: (email||'').toLowerCase(), role: 'client' });
-  if (!u) return res.status(400).json({ error: 'Invalid credentials' });
-  const ok = await bcrypt.compare(password || '', u.passwordHash);
-  if (!ok) return res.status(400).json({ error: 'Invalid credentials' });
-  res.json({ token: makeToken(u), user: { id: u.id, name: u.name, role: u.role } });
-});
+// Accept both old and new file field names
+const kycUpload = upload.fields([
+  { name:'passport', maxCount:1 },           // old
+  { name:'proofOfAddress', maxCount:1 },     // old
+  { name:'companyDocs', maxCount:20 },       // old
+  { name:'selfie', maxCount:1 },             // old
+  { name:'docs_id', maxCount:2 },            // new -> passport
+  { name:'docs_poa', maxCount:5 },           // new -> proofOfAddress
+  { name:'docs_corporate', maxCount:20 },    // new -> companyDocs
+  { name:'docs_sof', maxCount:20 },          // new -> append into companyDocs
+  { name:'selfie_file', maxCount:1 }         // new -> selfie
+]);
 
-app.get('/api/auth/me', authRequired(), async (req,res)=>{
-  const u = await User.findById(req.user.sub).select('email name role createdAt');
-  if (!u) return res.status(404).json({ error: 'Not found' });
-  res.json({ user: { email: u.email, name: u.name, role: u.role, createdAt: u.createdAt } });
-});
+function collectFiles(req, names) {
+  const out = [];
+  for (const n of names) {
+    const arr = req.files?.[n] || [];
+    out.push(...arr);
+  }
+  return out;
+}
 
-// Upsert client (create/update user + create/attach active account)
-// Protected by x-seed-key = DEV_SEED_KEY
-app.post('/api/admin/upsert-client', async (req, res) => {
-  try {
-    const key = req.headers['x-seed-key'] || '';
-    if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error:'Forbidden' });
-    if (!mongoReady) return res.status(500).json({ error:'Mongo not configured' });
+async function onboardingHandler(req,res){
+  try{
+    const tsToken = req.body?.['cf_turnstile_response'] || req.body?.['cf-turnstile-response'] || '';
+    const ok = await verifyTurnstile(tsToken, req.ip);
+    if(!ok) return res.status(400).json({error:'Captcha verification failed'});
 
-    const {
-      email, password, name,
-      companyName = '',
-      createAccount = true,
-      status = 'active',
-      currency = 'USD',
-      amount = 0,
-      ts
-    } = req.body || {};
+    const rawPassport = collectFiles(req, ['passport','docs_id']);
+    const rawPOA     = collectFiles(req, ['proofOfAddress','docs_poa']);
+    const rawCorp    = collectFiles(req, ['companyDocs','docs_corporate','docs_sof']);
+    const rawSelfie  = collectFiles(req, ['selfie','selfie_file']);
 
-    if (!email || !password) return res.status(400).json({ error:'email and password required' });
+    const gfs = getGridFSBucket();
 
-    let user = await User.findOne({ email: email.toLowerCase(), role: 'client' });
-    if (!user) {
-      user = await User.create({
-        email: email.toLowerCase(),
-        name: name || email.split('@')[0],
-        role: 'client',
-        passwordHash: await bcrypt.hash(password, 10)
-      });
-    } else {
-      if (name) user.name = name;
-      user.passwordHash = await bcrypt.hash(password, 10);
-      await user.save();
-    }
-
-    let acct = null;
-    if (createAccount) {
-      acct = await Account.findOne({ owner: user._id, companyName });
-      if (!acct) {
-        acct = await Account.create({
-          accountNo: genAccountNo(),
-          owner: user._id,
-          companyName,
-          status,
-          currency,
-          balance: amount,
-          lines: amount > 0 ? [{
-            ts: ts ? new Date(ts) : new Date(),
-            type: 'credit', amount, currency, description: 'Initial', meta: { source: 'admin-upsert' }
-          }] : []
-        });
-      } else {
-        acct.status = status;
-        acct.currency = currency || acct.currency;
-        await acct.save();
+    async function ingest(list){
+      const out = [];
+      for (const f of list) {
+        if (!ALLOWED_MIME.has(f.mimetype)) {
+          return { error:`Unsupported file type: ${f.mimetype}` };
+        }
+        const sha256 = createHash('sha256').update(f.buffer).digest('hex');
+        const av = await clamScan(f.buffer); // may skip
+        const filename = `${Date.now()}_${f.originalname}`;
+        const us = gfs.openUploadStream(filename,{contentType:f.mimetype}); us.end(f.buffer);
+        const fin = await new Promise((resolve,reject)=>{ us.on('finish',resolve); us.on('error',reject); });
+        out.push({ gridfsId:fin._id, filename, mime:f.mimetype, size:f.size, sha256, av });
       }
+      return { out };
     }
 
-    res.json({
-      ok: true,
-      user: { email: user.email, name: user.name },
-      account: acct ? {
-        accountNo: acct.accountNo, status: acct.status, currency: acct.currency,
-        balance: acct.balance, companyName: acct.companyName
-      } : null
+    const p1 = await ingest(rawPassport); if (p1.error) return res.status(415).json({ error:p1.error });
+    const p2 = await ingest(rawPOA);     if (p2.error) return res.status(415).json({ error:p2.error });
+    const p3 = await ingest(rawCorp);    if (p3.error) return res.status(415).json({ error:p3.error });
+    const p4 = await ingest(rawSelfie);  if (p4.error) return res.status(415).json({ error:p4.error });
+
+    const b = req.body || {};
+    const fullName     = b.fullName || b.authorized_person || b.authorised_person || '';
+    const companyName  = b.companyName || b.company_name || '';
+    const address      = b.address || b.company_address || '';
+    const currency     = b.currency || '';
+    const accountType  = b.accountType || b.account_type || '';
+    const commercialRegistration = b.commercialRegistration || b.commercial_registration || '';
+    const sourceOfFunds = b.sourceOfFunds || b.source_of_funds || '';
+    const notes        = b.notes || '';
+
+    const applicationId = randomUUID();
+
+    const doc = await Application.create({
+      applicationId, status:'received',
+      fields:{
+        fullName,
+        email: b.email || '',
+        phone: b.phone || '',
+        companyName,
+        country: b.country || '',
+        address, currency, accountType, commercialRegistration, sourceOfFunds, notes,
+        extra: b
+      },
+      files:{
+        passport: p1.out,
+        proofOfAddress: p2.out,
+        companyDocs: p3.out,
+        selfie: p4.out
+      },
+      submittedByIp: req.ip
     });
+
+    sendNotify('New Account Application', `
+      <h3>New Application Received</h3>
+      <p><b>ID:</b> ${doc.applicationId}</p>
+      <p><b>Company:</b> ${companyName||'-'}<br/>
+         <b>Contact:</b> ${fullName||'-'} · ${b.email||'-'} · ${b.phone||'-'}<br/>
+         <b>Country:</b> ${b.country||'-'}</p>
+    `).catch(()=>{});
+
+    return res.status(202).json({ applicationId:doc.applicationId, status:doc.status, receivedAt:doc.createdAt });
+  }catch(e){
+    console.error('onboarding submit error:', e);
+    return res.status(500).json({ error:'Server error' });
+  }
+}
+
+// Mount both routes (alias kept for the frontend wiring)
+app.post('/api/onboarding/submit', kycUpload, onboardingHandler);
+app.post('/api/onboarding/account-open', kycUpload, onboardingHandler);
+
+// Contact
+app.post('/api/contact', upload.none(), async (req,res)=>{
+  const tsToken = req.body?.['cf_turnstile_response'] || req.body?.['cf-turnstile-response'] || '';
+  const ok = await verifyTurnstile(tsToken, req.ip);
+  if(!ok) return res.status(400).json({error:'Captcha verification failed'});
+  const { name='', email='', phone='', subject='', message='' } = req.body||{};
+  await ContactMessage.create({ name, email, phone, subject, message, meta:{ userAgent:req.headers['user-agent']||'', ip:req.ip } });
+  sendNotify('New Contact Message', `
+    <h3>New Contact Message</h3>
+    <p><b>Name:</b> ${name} · <b>Email:</b> ${email} · <b>Phone:</b> ${phone}</p>
+    <p><b>Subject:</b> ${subject}</p>
+    <pre>${(message||'').replace(/[<>&]/g, s => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[s]))}</pre>
+  `).catch(()=>{});
+  res.status(204).end();
+});
+
+// Admin: list, detail, file download
+app.get('/api/admin/applications', authRequired('admin'), async (_req,res)=>{
+  const items = await Application.find().sort({ createdAt:-1 }).limit(100);
+  res.json({ items });
+});
+app.get('/api/admin/applications/:id', authRequired('admin'), async (req,res)=>{
+  const item = await Application.findOne({ applicationId: req.params.id });
+  if(!item) return res.status(404).json({error:'Not found'}); res.json({ item });
+});
+app.get('/api/admin/applications/:id/files/:field/:gridId', authRequired('admin'), async (req,res)=>{
+  const { id, field, gridId }=req.params;
+  const appDoc = await Application.findOne({ applicationId:id }); if(!appDoc) return res.status(404).json({error:'Application not found'});
+  const arr=(appDoc.files && appDoc.files[field])||[]; const meta=arr.find(f=>String(f.gridfsId)===gridId);
+  if(!meta) return res.status(404).json({error:'File not found'});
+  const oid=tryObjectId(gridId); if(!oid) return res.status(400).json({error:'Bad file id'});
+  res.setHeader('Content-Type', meta.mime || 'application/octet-stream');
+  res.setHeader('Content-Disposition', `attachment; filename="${meta.filename || 'file'}"`);
+  getGridFSBucket().openDownloadStream(oid).on('error',()=>res.status(500).end()).pipe(res);
+});
+
+// ───────────────── A) Admin: set user display name (company holder)
+app.post('/api/admin/set-user-name', async (req, res) => {
+  try {
+    const key = req.headers['x-seed-key'];
+    if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error: 'Forbidden' });
+    const { email, name } = req.body || {};
+    if (!email || !name) return res.status(400).json({ error: 'email and name required' });
+    const u = await User.findOne({ email: email.toLowerCase() });
+    if (!u) return res.status(404).json({ error: 'User not found' });
+    u.name = name.trim();
+    await u.save();
+    res.json({ ok:true, user:{ email:u.email, name:u.name }});
   } catch (e) {
-    console.error('upsert-client error:', e);
+    console.error('set-user-name', e);
     res.status(500).json({ error:'Server error' });
   }
 });
 
-// Client overview
+// ───────────────── B) Client overview (holder + authorisedPerson + accounts)
 app.get('/api/client/overview', authRequired('client'), async (req,res)=>{
+  const u = await User.findById(req.user.sub).select('email name role');
+  if (!u) return res.status(404).json({ error:'Not found' });
   const accounts = await Account.find({ owner: req.user.sub }).select('-__v');
-  res.json({ accounts });
+
+  const local = (u.email || '').split('@')[0] || '';
+  const authorisedPerson = local.replace(/[._-]+/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+
+  res.json({
+    holder: u.name || '(Account Holder)',
+    authorisedPerson,
+    accounts
+  });
 });
 
-// 404
-app.use((_req,res) => res.status(404).json({ error: 'Not found' }));
+// Dev seed account (unchanged)
+app.post('/api/admin/dev-seed-account', async (req,res)=>{
+  const key=req.headers['x-seed-key']; if(!DEV_SEED_KEY || key!==DEV_SEED_KEY) return res.status(403).json({error:'Forbidden'});
+  const { email, amount=0, currency='USD', ts, status='active' } = req.body || {};
+  if(!email) return res.status(400).json({error:'email required'});
 
-// ─────────────────────────────────────────────────────────── Boot
-app.listen(PORT, () => console.log(`🚀 API listening on :${PORT}`));
+  let user = await User.findOne({ email: email.toLowerCase() });
+  if (!user) {
+    user = await User.create({
+      email: email.toLowerCase(),
+      name: email.split('@')[0],     // can be overwritten later by set-user-name
+      role: 'client',
+      passwordHash: await bcrypt.hash(randomUUID().slice(0,12), 10)
+    });
+  }
+
+  const accountNo = genAccountNo();
+  const when = ts ? new Date(ts) : new Date();
+  const acct = await Account.create({
+    accountNo, owner: user._id, status, currency,
+    balance: amount,
+    lines: amount ? [{ ts: when, type:'credit', amount, currency, description:'Initial Credit', meta:{ source:'admin-seed' } }] : []
+  });
+
+  res.json({ ok:true, accountNo: acct.accountNo, user: user.email, status: acct.status });
+});
+
+// Friendly multer errors
+app.use((err, _req, res, next) => {
+  if (err && err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json({ error: 'File too large (max 16MB each)' });
+  }
+  next(err);
+});
+
+// Boot
+(async()=>{
+  try {
+    await connectMongo(MONGODB_URI);
+    app.listen(PORT, ()=>console.log(`API :${PORT}`));
+    const stop=async()=>{ await shutdown(); process.exit(0); };
+    process.on('SIGINT', stop); process.on('SIGTERM', stop);
+  } catch(e){ console.error('Boot error:', e); process.exit(1); }
+})();
