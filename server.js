@@ -1,17 +1,18 @@
-// server.js — Maltese First Capital (Simplified API)
+// server.js — Maltese First Capital (Simplified API, r1.0.2)
 // Focus: auth, admin upsert, client overview, email-only onboarding
-// No GridFS, no Helmet, minimal deps; designed for Render.
+// Minimal deps; designed for Render.
 
 // ──────────────────────────────────────────────────────────────────────────────
 require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
+const express  = require('express');
+const cors     = require('cors');
 const mongoose = require('mongoose');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
+const bcrypt   = require('bcryptjs');
+const jwt      = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
-const multer = require('multer');
+const multer   = require('multer');
 
+// ENV
 const {
   PORT = 8080,
   NODE_ENV = 'production',
@@ -20,7 +21,7 @@ const {
   DEV_SEED_KEY,
   // CORS (comma-separated)
   CORS_ORIGIN = 'https://maltesefirst.com,https://www.maltesefirst.com',
-  // SMTP (optional but recommended)
+  // SMTP
   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS,
   NOTIFY_FROM = 'Maltese First <no-reply@maltesefirst.com>',
   NOTIFY_TO = 'hello@maltesefirst.com'
@@ -31,7 +32,7 @@ if (!MONGODB_URI) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Mailer (optional — onboarding/email-only uses this)
+// Mailer
 let mailer = null;
 if (SMTP_HOST && SMTP_PORT && SMTP_USER && SMTP_PASS) {
   mailer = nodemailer.createTransport({
@@ -41,14 +42,16 @@ if (SMTP_HOST && SMTP_PORT && SMTP_USER && SMTP_PASS) {
     auth: { user: SMTP_USER, pass: SMTP_PASS }
   });
 }
-async function sendMail(subject, html, attachments = []) {
+async function sendMail({ subject, html, attachments = [], replyTo }) {
   if (!mailer) return { ok:false, delivered:false, reason:'mailer_not_configured' };
   const info = await mailer.sendMail({
     from: NOTIFY_FROM,
-    to: NOTIFY_TO,
-    subject, html,
-    attachments
-  });
+    to:   NOTIFY_TO || 'hello@maltesefirst.com',
+    subject,
+    html,
+    text: html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(), // simple text fallback
+    replyTo
+  , attachments });
   return { ok:true, delivered:true, messageId: info.messageId, attachments: attachments.length };
 }
 
@@ -74,8 +77,10 @@ const uploadAny = multer({ storage: multer.memoryStorage(), limits:{ fileSize: 1
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Mongo + Models
-(async () => { await mongoose.connect(MONGODB_URI, { maxPoolSize: 20 }); console.log('Mongo connected'); })()
-.catch(e => { console.error('Mongo connect failed:', e); process.exit(1); });
+(async () => {
+  await mongoose.connect(MONGODB_URI, { maxPoolSize: 20 });
+  console.log('Mongo connected');
+})().catch(e => { console.error('Mongo connect failed:', e); process.exit(1); });
 
 const User = mongoose.model('User', new mongoose.Schema({
   email: { type:String, unique:true, index:true, required:true, lowercase:true, trim:true },
@@ -110,13 +115,19 @@ function authRequired(role){
   return (req,res,next)=>{
     const hdr=req.headers.authorization||''; const t=hdr.startsWith('Bearer ')?hdr.slice(7):null;
     if(!t) return res.status(401).json({error:'Missing token'});
-    try{ const p=jwt.verify(t, JWT_SECRET); if(role && p.role!==role) return res.status(403).json({error:'Forbidden'}); req.user=p; next(); }
-    catch{ return res.status(401).json({error:'Invalid token'}); }
+    try{
+      const p=jwt.verify(t, JWT_SECRET);
+      if(role && p.role!==role) return res.status(403).json({error:'Forbidden'});
+      req.user=p; next();
+    }catch{
+      return res.status(401).json({error:'Invalid token'});
+    }
   };
 }
 async function genAccountNoUnique() {
-  for (let i=0;i<20;i++){
+  for (let i=0;i<25;i++){
     const n = String(Math.floor(10_000_000 + Math.random()*90_000_000));
+    // eslint-disable-next-line no-await-in-loop
     if (!(await Account.exists({ accountNo:n }))) return n;
   }
   throw new Error('Could not generate unique account number');
@@ -124,7 +135,7 @@ async function genAccountNoUnique() {
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Health
-app.get('/api/health', (_req,res)=> res.json({ ok:true, env:NODE_ENV, version:'simple-1.0.0', uptime:process.uptime() }));
+app.get('/api/health', (_req,res)=> res.json({ ok:true, env:NODE_ENV, version:'simple-1.0.2', uptime:process.uptime() }));
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Auth (client + admin)
@@ -164,14 +175,14 @@ app.post('/api/admin/bootstrap', async (req,res)=>{
   res.json({ ok:true });
 });
 
-// Admin: upsert client + create account (easiest path)
+// Admin: upsert client + create account
 app.post('/api/admin/upsert-client', async (req,res)=>{
   const key = req.headers['x-seed-key'];
   if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error:'Forbidden' });
 
   const {
     email, password, name,
-    companyName,       // will be Account holderName
+    companyName,       // -> Account holderName
     createAccount = true,
     status = 'active', currency = 'USD',
     amount = 0,        // opening balance (credit)
@@ -243,7 +254,7 @@ app.post('/api/admin/upsert-client', async (req,res)=>{
   });
 });
 
-// Admin: light setters (company holder / user display name)
+// Admin: light setters
 app.post('/api/admin/set-user-name', async (req,res)=>{
   const key = req.headers['x-seed-key'];
   if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error:'Forbidden' });
@@ -278,17 +289,24 @@ app.get('/api/client/overview', authRequired('client'), async (req,res)=>{
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Onboarding — Email Only (files become attachments)
-app.post('/api/onboarding/email-only', uploadAny.any(), async (req,res)=>{
+// NOTE: we wrap the core logic in a function and mount it on two routes.
+const emailOnlyHandler = async (req, res) => {
   try{
     const b = req.body || {};
+
+    // Body -> table
+    const esc = s => String(s).replace(/[<>&]/g, t => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[t]));
     const fields = Object.entries(b)
-        .map(([k,v]) => `<tr><td style="padding:6px 10px;border-bottom:1px solid #eee;"><b>${k}</b></td><td style="padding:6px 10px;border-bottom:1px solid #eee;">${String(v).replace(/[<>&]/g, s => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[s]))}</td></tr>`)
-        .join('');
+      .map(([k,v]) => `<tr>
+        <td style="padding:6px 10px;border-bottom:1px solid #eee;"><b>${esc(k)}</b></td>
+        <td style="padding:6px 10px;border-bottom:1px solid #eee;">${esc(v)}</td>
+      </tr>`).join('');
+
     const html = `
       <div style="font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif">
         <h2>New Account Application</h2>
-        <table style="border-collapse:collapse;border:1px solid #eee">${fields}</table>
-        <p style="color:#666">Attachments: ${ (req.files||[]).length }</p>
+        <table style="border-collapse:collapse;border:1px solid #eee">${fields || '<tr><td style="padding:8px">No fields</td></tr>'}</table>
+        <p style="color:#666">Attachments: ${(req.files||[]).length}</p>
       </div>`;
 
     const attachments = (req.files||[]).map(f => ({
@@ -297,21 +315,25 @@ app.post('/api/onboarding/email-only', uploadAny.any(), async (req,res)=>{
       contentType: f.mimetype
     }));
 
-    const result = await sendMail('New Account Application (Email Only)', html, attachments);
-    if (!result.ok) return res.status(500).json({ ok:false, error:'MAIL_FAILED' });
+    const result = await sendMail({
+      subject: `New Account Application (Email Only) — ${b.company_name || b.companyName || b.authorized_person || b.authorised_person || 'Client'}`,
+      html,
+      attachments,
+      replyTo: b.email || undefined
+    });
+    if (!result.ok) return res.status(500).json({ ok:false, error:'MAIL_FAILED', reason: result.reason || null });
+
     res.json(result);
   }catch(e){
     console.error('email-only error:', e);
-    res.status(500).json({ error:'Server error' });
+    res.status(500).json({ ok:false, error:'SERVER_ERROR' });
   }
-});
+};
 
-// Compatibility alias: accept multiparts and forward to email flow
-app.post('/api/onboarding/submit', uploadAny.any(), async (req,res)=> {
-  // reuse handler
-  req.url = '/api/onboarding/email-only';
-  app._router.handle(req,res,()=>{});
-});
+// Mount with Multer
+app.post('/api/onboarding/email-only', uploadAny.any(), emailOnlyHandler);
+// Compatibility alias (old frontends)
+app.post('/api/onboarding/submit',     uploadAny.any(), emailOnlyHandler);
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Boot
