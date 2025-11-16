@@ -1,18 +1,17 @@
-// server.js — Maltese First Capital (Simplified API, r1.0.2)
-// Focus: auth, admin upsert, client overview, email-only onboarding
-// Minimal deps; designed for Render.
+// server.js — Maltese First Capital (Simplified API)
+// Focus: auth, admin upsert, client overview, email-only onboarding, password-change request
+// No GridFS, no Helmet, minimal deps; designed for Render.
 
 // ──────────────────────────────────────────────────────────────────────────────
 require('dotenv').config();
-const express  = require('express');
-const cors     = require('cors');
+const express = require('express');
+const cors = require('cors');
 const mongoose = require('mongoose');
-const bcrypt   = require('bcryptjs');
-const jwt      = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
-const multer   = require('multer');
+const multer = require('multer');
 
-// ENV
 const {
   PORT = 8080,
   NODE_ENV = 'production',
@@ -28,7 +27,8 @@ const {
 } = process.env;
 
 if (!MONGODB_URI) {
-  console.error('MONGODB_URI is required'); process.exit(1);
+  console.error('MONGODB_URI is required');
+  process.exit(1);
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -42,17 +42,19 @@ if (SMTP_HOST && SMTP_PORT && SMTP_USER && SMTP_PASS) {
     auth: { user: SMTP_USER, pass: SMTP_PASS }
   });
 }
-async function sendMail({ subject, html, attachments = [], replyTo }) {
-  if (!mailer) return { ok:false, delivered:false, reason:'mailer_not_configured' };
+
+async function sendMail(subject, html, attachments = []) {
+  if (!mailer) {
+    return { ok: false, delivered: false, reason: 'mailer_not_configured' };
+  }
   const info = await mailer.sendMail({
     from: NOTIFY_FROM,
-    to:   NOTIFY_TO || 'hello@maltesefirst.com',
+    to: NOTIFY_TO,
     subject,
     html,
-    text: html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(), // simple text fallback
-    replyTo
-  , attachments });
-  return { ok:true, delivered:true, messageId: info.messageId, attachments: attachments.length };
+    attachments
+  });
+  return { ok: true, delivered: true, messageId: info.messageId, attachments: attachments.length };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -61,136 +63,196 @@ const app = express();
 app.set('trust proxy', 1);
 
 const ALLOWED = CORS_ORIGIN.split(',').map(s => s.trim()).filter(Boolean);
-app.use(cors({
-  origin: (origin, cb) => (!origin || ALLOWED.includes(origin)) ? cb(null, true) : cb(new Error('Not allowed by CORS')),
-  credentials: false,
-  methods: ['GET','POST','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization','x-seed-key']
-}));
+app.use(
+  cors({
+    origin: (origin, cb) =>
+      !origin || ALLOWED.includes(origin) ? cb(null, true) : cb(new Error('Not allowed by CORS')),
+    credentials: false,
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-seed-key']
+  })
+);
 app.options('*', cors());
 
-app.use(express.json({ limit:'4mb' }));
-app.use(express.urlencoded({ extended:true, limit:'4mb' }));
+app.use(express.json({ limit: '4mb' }));
+app.use(express.urlencoded({ extended: true, limit: '4mb' }));
 
 // Multer (in-memory) for email-only attachments
-const uploadAny = multer({ storage: multer.memoryStorage(), limits:{ fileSize: 16 * 1024 * 1024 } });
+const uploadAny = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 16 * 1024 * 1024 }
+});
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Mongo + Models
 (async () => {
   await mongoose.connect(MONGODB_URI, { maxPoolSize: 20 });
   console.log('Mongo connected');
-})().catch(e => { console.error('Mongo connect failed:', e); process.exit(1); });
+})().catch(e => {
+  console.error('Mongo connect failed:', e);
+  process.exit(1);
+});
 
-const User = mongoose.model('User', new mongoose.Schema({
-  email: { type:String, unique:true, index:true, required:true, lowercase:true, trim:true },
-  passwordHash: { type:String, required:true },
-  role: { type:String, enum:['client','admin'], default:'client', index:true },
-  name: { type:String, trim:true }
-},{timestamps:true}));
+const User = mongoose.model(
+  'User',
+  new mongoose.Schema(
+    {
+      email: {
+        type: String,
+        unique: true,
+        index: true,
+        required: true,
+        lowercase: true,
+        trim: true
+      },
+      passwordHash: { type: String, required: true },
+      role: { type: String, enum: ['client', 'admin'], default: 'client', index: true },
+      name: { type: String, trim: true }
+    },
+    { timestamps: true }
+  )
+);
 
-const TxnSchema = new mongoose.Schema({
-  ts: { type: Date, default: () => new Date() },
-  type: { type: String, enum: ['credit','debit'], required: true },
-  amount: { type: Number, required: true },
-  currency: { type: String, default: 'USD' },
-  description: String,
-  meta: Object
-}, { _id: false });
+const TxnSchema = new mongoose.Schema(
+  {
+    ts: { type: Date, default: () => new Date() },
+    type: { type: String, enum: ['credit', 'debit'], required: true },
+    amount: { type: Number, required: true },
+    currency: { type: String, default: 'USD' },
+    description: String,
+    meta: Object
+  },
+  { _id: false }
+);
 
-const Account = mongoose.model('Account', new mongoose.Schema({
-  accountNo: { type:String, unique:true, index:true },   // 8-digit
-  owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index:true },
-  holderName: { type:String, trim:true },                // Company / Account Holder
-  status: { type:String, enum:['not_activated','active','suspended'], default:'not_activated', index:true },
-  currency: { type:String, default:'USD' },
-  balance: { type:Number, default:0 },
-  lines: [TxnSchema]
-},{timestamps:true}));
+const Account = mongoose.model(
+  'Account',
+  new mongoose.Schema(
+    {
+      accountNo: { type: String, unique: true, index: true }, // 8-digit
+      owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
+      holderName: { type: String, trim: true }, // Company / Account Holder
+      status: {
+        type: String,
+        enum: ['not_activated', 'active', 'suspended'],
+        default: 'not_activated',
+        index: true
+      },
+      currency: { type: String, default: 'USD' },
+      balance: { type: Number, default: 0 },
+      lines: [TxnSchema]
+    },
+    { timestamps: true }
+  )
+);
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Helpers
-function makeToken(u){ return jwt.sign({ sub:u.id, role:u.role, name:u.name }, JWT_SECRET, { expiresIn:'12h' }); }
-function authRequired(role){
-  return (req,res,next)=>{
-    const hdr=req.headers.authorization||''; const t=hdr.startsWith('Bearer ')?hdr.slice(7):null;
-    if(!t) return res.status(401).json({error:'Missing token'});
-    try{
-      const p=jwt.verify(t, JWT_SECRET);
-      if(role && p.role!==role) return res.status(403).json({error:'Forbidden'});
-      req.user=p; next();
-    }catch{
-      return res.status(401).json({error:'Invalid token'});
+function makeToken(u) {
+  return jwt.sign({ sub: u.id, role: u.role, name: u.name }, JWT_SECRET, {
+    expiresIn: '12h'
+  });
+}
+
+function authRequired(role) {
+  return (req, res, next) => {
+    const hdr = req.headers.authorization || '';
+    const t = hdr.startsWith('Bearer ') ? hdr.slice(7) : null;
+    if (!t) return res.status(401).json({ error: 'Missing token' });
+    try {
+      const p = jwt.verify(t, JWT_SECRET);
+      if (role && p.role !== role) return res.status(403).json({ error: 'Forbidden' });
+      req.user = p;
+      next();
+    } catch {
+      return res.status(401).json({ error: 'Invalid token' });
     }
   };
 }
+
 async function genAccountNoUnique() {
-  for (let i=0;i<25;i++){
-    const n = String(Math.floor(10_000_000 + Math.random()*90_000_000));
-    // eslint-disable-next-line no-await-in-loop
-    if (!(await Account.exists({ accountNo:n }))) return n;
+  for (let i = 0; i < 20; i++) {
+    const n = String(Math.floor(10_000_000 + Math.random() * 90_000_000));
+    const exists = await Account.exists({ accountNo: n });
+    if (!exists) return n;
   }
   throw new Error('Could not generate unique account number');
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Health
-app.get('/api/health', (_req,res)=> res.json({ ok:true, env:NODE_ENV, version:'simple-1.0.2', uptime:process.uptime() }));
+app.get('/api/health', (_req, res) =>
+  res.json({ ok: true, env: NODE_ENV, version: 'simple-1.0.1', uptime: process.uptime() })
+);
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Auth (client + admin)
-app.post('/api/auth/login', async (req,res)=>{
+app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body || {};
-  const u = await User.findOne({ email:(email||'').toLowerCase(), role:'client' });
-  if(!u) return res.status(400).json({error:'Invalid credentials'});
-  const ok = await bcrypt.compare(password||'', u.passwordHash);
-  if(!ok) return res.status(400).json({error:'Invalid credentials'});
-  res.json({ token:makeToken(u), user:{ email:u.email, name:u.name, role:u.role } });
+  const u = await User.findOne({ email: (email || '').toLowerCase(), role: 'client' });
+  if (!u) return res.status(400).json({ error: 'Invalid credentials' });
+  const ok = await bcrypt.compare(password || '', u.passwordHash);
+  if (!ok) return res.status(400).json({ error: 'Invalid credentials' });
+  res.json({ token: makeToken(u), user: { email: u.email, name: u.name, role: u.role } });
 });
-app.post('/api/admin/login', async (req,res)=>{
+
+app.post('/api/admin/login', async (req, res) => {
   const { email, password } = req.body || {};
-  const u = await User.findOne({ email:(email||'').toLowerCase(), role:'admin' });
-  if(!u) return res.status(400).json({error:'Invalid credentials'});
-  const ok = await bcrypt.compare(password||'', u.passwordHash);
-  if(!ok) return res.status(400).json({error:'Invalid credentials'});
-  res.json({ token:makeToken(u), user:{ email:u.email, name:u.name, role:u.role } });
+  const u = await User.findOne({ email: (email || '').toLowerCase(), role: 'admin' });
+  if (!u) return res.status(400).json({ error: 'Invalid credentials' });
+  const ok = await bcrypt.compare(password || '', u.passwordHash);
+  if (!ok) return res.status(400).json({ error: 'Invalid credentials' });
+  res.json({ token: makeToken(u), user: { email: u.email, name: u.name, role: u.role } });
 });
-app.get('/api/auth/me', authRequired(), async (req,res)=>{
+
+app.get('/api/auth/me', authRequired(), async (req, res) => {
   const u = await User.findById(req.user.sub).select('email name role createdAt');
-  if(!u) return res.status(404).json({error:'Not found'});
-  res.json({ user:u });
+  if (!u) return res.status(404).json({ error: 'Not found' });
+  res.json({ user: u });
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Admin bootstrap (seed key)
-app.post('/api/admin/bootstrap', async (req,res)=>{
+app.post('/api/admin/bootstrap', async (req, res) => {
   const key = req.headers['x-seed-key'];
-  if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error:'Forbidden' });
-  const { email, password, name='Administrator' } = req.body || {};
-  if (!email || !password) return res.status(400).json({ error:'email and password required' });
-  const exists = await User.findOne({ email:email.toLowerCase(), role:'admin' });
-  if (exists) return res.json({ ok:true, already:true });
+  if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error: 'Forbidden' });
+
+  const { email, password, name = 'Administrator' } = req.body || {};
+  if (!email || !password) return res.status(400).json({ error: 'email and password required' });
+
+  const existing = await User.findOne({ email: email.toLowerCase(), role: 'admin' });
+  if (existing) return res.json({ ok: true, already: true });
+
   const passwordHash = await bcrypt.hash(password, 10);
-  await User.create({ email:email.toLowerCase(), passwordHash, role:'admin', name });
-  res.json({ ok:true });
+  await User.create({
+    email: email.toLowerCase(),
+    passwordHash,
+    role: 'admin',
+    name
+  });
+
+  res.json({ ok: true });
 });
 
 // Admin: upsert client + create account
-app.post('/api/admin/upsert-client', async (req,res)=>{
+app.post('/api/admin/upsert-client', async (req, res) => {
   const key = req.headers['x-seed-key'];
-  if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error:'Forbidden' });
+  if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error: 'Forbidden' });
 
   const {
-    email, password, name,
-    companyName,       // -> Account holderName
+    email,
+    password,
+    name,
+    companyName, // => Account.holderName
     createAccount = true,
-    status = 'active', currency = 'USD',
-    amount = 0,        // opening balance (credit)
-    ts                 // optional timestamp for the credit
+    status = 'active',
+    currency = 'USD',
+    amount = 0,
+    ts
   } = req.body || {};
 
   if (!email || !password || !name || !companyName) {
-    return res.status(400).json({ error:'email, password, name, companyName required' });
+    return res.status(400).json({ error: 'email, password, name, companyName required' });
   }
 
   // user
@@ -200,14 +262,16 @@ app.post('/api/admin/upsert-client', async (req,res)=>{
       email: email.toLowerCase(),
       name,
       role: 'client',
-      passwordHash: await bcrypt.hash(password, 10),
+      passwordHash: await bcrypt.hash(password, 10)
     });
   } else {
-    // update name/password if provided
     const patch = {};
     if (name) patch.name = name;
     if (password) patch.passwordHash = await bcrypt.hash(password, 10);
-    if (Object.keys(patch).length) { Object.assign(user, patch); await user.save(); }
+    if (Object.keys(patch).length) {
+      Object.assign(user, patch);
+      await user.save();
+    }
   }
 
   let account = null;
@@ -218,21 +282,26 @@ app.post('/api/admin/upsert-client', async (req,res)=>{
         accountNo: await genAccountNoUnique(),
         owner: user._id,
         holderName: companyName,
-        status, currency,
+        status,
+        currency,
         balance: 0,
         lines: []
       });
     }
-    // ensure holder & status
+
+    // ensure holder/status
     account.holderName = companyName;
     account.status = status;
     account.currency = currency;
 
-    // opening credit if amount > 0 and not already present
+    // opening credit (optional)
     if (amount > 0 && !account.lines.some(l => l.meta && l.meta.kind === 'opening')) {
       const when = ts ? new Date(ts) : new Date();
       account.lines.push({
-        ts: when, type: 'credit', amount, currency,
+        ts: when,
+        type: 'credit',
+        amount,
+        currency,
         description: 'Opening Credit',
         meta: { kind: 'opening', source: 'admin-upsert' }
       });
@@ -244,99 +313,201 @@ app.post('/api/admin/upsert-client', async (req,res)=>{
   res.json({
     ok: true,
     user: { email: user.email, name: user.name },
-    account: account ? {
-      accountNo: account.accountNo,
-      holderName: account.holderName,
-      status: account.status,
-      currency: account.currency,
-      balance: account.balance
-    } : null
+    account: account
+      ? {
+          accountNo: account.accountNo,
+          holderName: account.holderName,
+          status: account.status,
+          currency: account.currency,
+          balance: account.balance
+        }
+      : null
   });
 });
 
-// Admin: light setters
-app.post('/api/admin/set-user-name', async (req,res)=>{
+// Admin: set user display name
+app.post('/api/admin/set-user-name', async (req, res) => {
   const key = req.headers['x-seed-key'];
-  if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error:'Forbidden' });
+  if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error: 'Forbidden' });
+
   const { email, name } = req.body || {};
-  if (!email || !name) return res.status(400).json({ error:'email and name required' });
-  const u = await User.findOneAndUpdate({ email: email.toLowerCase() }, { $set:{ name } }, { new:true }).select('email name');
-  if (!u) return res.status(404).json({ error:'User not found' });
-  res.json({ ok:true, user:u });
+  if (!email || !name) return res.status(400).json({ error: 'email and name required' });
+
+  const u = await User.findOneAndUpdate(
+    { email: email.toLowerCase() },
+    { $set: { name } },
+    { new: true }
+  ).select('email name');
+
+  if (!u) return res.status(404).json({ error: 'User not found' });
+  res.json({ ok: true, user: u });
 });
 
-app.post('/api/admin/set-account-holder', async (req,res)=>{
+// Admin: set account holder name
+app.post('/api/admin/set-account-holder', async (req, res) => {
   const key = req.headers['x-seed-key'];
-  if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error:'Forbidden' });
+  if (!DEV_SEED_KEY || key !== DEV_SEED_KEY) return res.status(403).json({ error: 'Forbidden' });
+
   const { email, holderName } = req.body || {};
-  if (!email || !holderName) return res.status(400).json({ error:'email and holderName required' });
+  if (!email || !holderName) return res.status(400).json({ error: 'email and holderName required' });
+
   const u = await User.findOne({ email: email.toLowerCase() }).select('_id');
-  if (!u) return res.status(404).json({ error:'User not found' });
-  const acct = await Account.findOneAndUpdate({ owner:u._id }, { $set:{ holderName } }, { new:true })
-               .select('accountNo holderName');
-  if (!acct) return res.status(404).json({ error:'Account not found' });
-  res.json({ ok:true, account:acct });
+  if (!u) return res.status(404).json({ error: 'User not found' });
+
+  const acct = await Account.findOneAndUpdate(
+    { owner: u._id },
+    { $set: { holderName } },
+    { new: true }
+  ).select('accountNo holderName');
+
+  if (!acct) return res.status(404).json({ error: 'Account not found' });
+  res.json({ ok: true, account: acct });
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Client: overview (JWT)
-app.get('/api/client/overview', authRequired('client'), async (req,res)=>{
+app.get('/api/client/overview', authRequired('client'), async (req, res) => {
   const accounts = await Account.find({ owner: req.user.sub })
-                    .select('accountNo holderName status currency balance lines createdAt updatedAt')
-                    .sort({ createdAt: -1 });
+    .select('accountNo holderName status currency balance lines createdAt updatedAt')
+    .sort({ createdAt: -1 });
+
   res.json({ accounts });
 });
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Onboarding — Email Only (files become attachments)
-// NOTE: we wrap the core logic in a function and mount it on two routes.
-const emailOnlyHandler = async (req, res) => {
-  try{
+// Onboarding — Email Only
+app.post('/api/onboarding/email-only', uploadAny.any(), async (req, res) => {
+  try {
     const b = req.body || {};
+    const safe = s =>
+      String(s).replace(/[<>&]/g, ch => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[ch] || ch));
 
-    // Body -> table
-    const esc = s => String(s).replace(/[<>&]/g, t => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[t]));
-    const fields = Object.entries(b)
-      .map(([k,v]) => `<tr>
-        <td style="padding:6px 10px;border-bottom:1px solid #eee;"><b>${esc(k)}</b></td>
-        <td style="padding:6px 10px;border-bottom:1px solid #eee;">${esc(v)}</td>
-      </tr>`).join('');
+    const rows = Object.entries(b)
+      .map(
+        ([k, v]) =>
+          `<tr><td style="padding:6px 10px;border-bottom:1px solid #eee;"><b>${safe(
+            k
+          )}</b></td><td style="padding:6px 10px;border-bottom:1px solid #eee;">${safe(
+            v
+          )}</td></tr>`
+      )
+      .join('');
 
     const html = `
       <div style="font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif">
         <h2>New Account Application</h2>
-        <table style="border-collapse:collapse;border:1px solid #eee">${fields || '<tr><td style="padding:8px">No fields</td></tr>'}</table>
-        <p style="color:#666">Attachments: ${(req.files||[]).length}</p>
+        <table style="border-collapse:collapse;border:1px solid #eee">${rows}</table>
+        <p style="color:#666">Attachments: ${(req.files || []).length}</p>
       </div>`;
 
-    const attachments = (req.files||[]).map(f => ({
+    const attachments = (req.files || []).map(f => ({
       filename: f.originalname,
       content: f.buffer,
       contentType: f.mimetype
     }));
 
-    const result = await sendMail({
-      subject: `New Account Application (Email Only) — ${b.company_name || b.companyName || b.authorized_person || b.authorised_person || 'Client'}`,
-      html,
-      attachments,
-      replyTo: b.email || undefined
-    });
-    if (!result.ok) return res.status(500).json({ ok:false, error:'MAIL_FAILED', reason: result.reason || null });
-
+    const result = await sendMail('New Account Application (Email Only)', html, attachments);
+    if (!result.ok) return res.status(500).json({ ok: false, error: 'MAIL_FAILED' });
     res.json(result);
-  }catch(e){
+  } catch (e) {
     console.error('email-only error:', e);
-    res.status(500).json({ ok:false, error:'SERVER_ERROR' });
+    res.status(500).json({ error: 'Server error' });
   }
-};
+});
 
-// Mount with Multer
-app.post('/api/onboarding/email-only', uploadAny.any(), emailOnlyHandler);
-// Compatibility alias (old frontends)
-app.post('/api/onboarding/submit',     uploadAny.any(), emailOnlyHandler);
+// Compatibility alias — old /submit → email-only
+app.post('/api/onboarding/submit', uploadAny.any(), async (req, res) => {
+  try {
+    // reuse same logic as email-only
+    const b = req.body || {};
+    const safe = s =>
+      String(s).replace(/[<>&]/g, ch => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[ch] || ch));
+
+    const rows = Object.entries(b)
+      .map(
+        ([k, v]) =>
+          `<tr><td style="padding:6px 10px;border-bottom:1px solid #eee;"><b>${safe(
+            k
+          )}</b></td><td style="padding:6px 10px;border-bottom:1px solid #eee;">${safe(
+            v
+          )}</td></tr>`
+      )
+      .join('');
+
+    const html = `
+      <div style="font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif">
+        <h2>New Account Application (Legacy Submit)</h2>
+        <table style="border-collapse:collapse;border:1px solid #eee">${rows}</table>
+        <p style="color:#666">Attachments: ${(req.files || []).length}</p>
+      </div>`;
+
+    const attachments = (req.files || []).map(f => ({
+      filename: f.originalname,
+      content: f.buffer,
+      contentType: f.mimetype
+    }));
+
+    const result = await sendMail('New Account Application (Submit Alias)', html, attachments);
+    if (!result.ok) return res.status(500).json({ ok: false, error: 'MAIL_FAILED' });
+    res.json(result);
+  } catch (e) {
+    console.error('submit-alias error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Change Password Request → email to hello@
+app.post('/api/change-password-request', async (req, res) => {
+  try {
+    const { email, currentPassword, newPassword } = req.body || {};
+    if (!email || !currentPassword || !newPassword) {
+      return res.status(400).json({ ok: false, error: 'MISSING_FIELDS' });
+    }
+
+    const safe = s =>
+      String(s).replace(/[<>&]/g, ch => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[ch] || ch));
+
+    const html = `
+      <div style="font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif">
+        <h2>Client Password Change Request</h2>
+        <p>The following client has requested a password change via the client portal:</p>
+        <table style="border-collapse:collapse;border:1px solid #eee">
+          <tr>
+            <td style="padding:6px 10px;border-bottom:1px solid #eee;"><b>Email</b></td>
+            <td style="padding:6px 10px;border-bottom:1px solid #eee;">${safe(email)}</td>
+          </tr>
+          <tr>
+            <td style="padding:6px 10px;border-bottom:1px solid #eee;"><b>Current Password (as entered)</b></td>
+            <td style="padding:6px 10px;border-bottom:1px solid #eee;">${safe(currentPassword)}</td>
+          </tr>
+          <tr>
+            <td style="padding:6px 10px;border-bottom:1px solid #eee;"><b>Requested New Password</b></td>
+            <td style="padding:6px 10px;border-bottom:1px solid #eee;">${safe(newPassword)}</td>
+          </tr>
+        </table>
+        <p style="color:#666;font-size:13px;margin-top:10px;">
+          Action required: verify client and update credentials in the mock store / core system.
+        </p>
+      </div>
+    `;
+
+    const result = await sendMail('Client Password Change Request', html, []);
+    if (!result.ok) {
+      return res.status(500).json({ ok: false, error: 'MAIL_FAILED' });
+    }
+    res.json({ ok: true, delivered: result.delivered });
+  } catch (e) {
+    console.error('change-password-request error:', e);
+    res.status(500).json({ ok: false, error: 'Server error' });
+  }
+});
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Boot
-const server = app.listen(PORT, ()=> console.log(`API listening on :${PORT}`));
-process.on('SIGTERM', ()=> server.close(()=>process.exit(0)));
-process.on('SIGINT',  ()=> server.close(()=>process.exit(0)));
+const server = app.listen(PORT, () => {
+  console.log(`API listening on :${PORT}`);
+});
+
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
+process.on('SIGINT', () => server.close(() => process.exit(0)));
